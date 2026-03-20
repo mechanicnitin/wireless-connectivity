@@ -1,7 +1,5 @@
 name: AP Firmware Upgrade Pipeline
 
-# Trigger: Only after merge to main (push event)
-# NOT on PR approval or PR review
 on:
   push:
     branches:
@@ -9,7 +7,7 @@ on:
     paths:
       - 'Dev/AP upgrade/site_list.csv'
       - '.github/workflows/ap-upgrade.yml'
-  workflow_dispatch:  # Allow manual trigger
+  workflow_dispatch:
 
 jobs:
   ap-upgrade-pipeline:
@@ -74,7 +72,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: validation-reports
+          name: pre-validation-report
           path: upgrade_validation_pre_*.txt
           retention-days: 30
           if-no-files-found: ignore
@@ -153,7 +151,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: validation-reports
+          name: post-validation-report
           path: upgrade_validation_post_*.txt
           retention-days: 30
           if-no-files-found: ignore
