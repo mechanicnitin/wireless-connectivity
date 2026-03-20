@@ -1,4 +1,4 @@
-name: AP Firmware Upgrade Pipeline
+name: AP Firmware Upgrade Pipeline (Merge)
 
 on:
   push:
@@ -6,12 +6,11 @@ on:
       - main
     paths:
       - 'Dev/AP upgrade/site_list.csv'
-      - '.github/workflows/ap-upgrade.yml'
   workflow_dispatch:
 
 jobs:
   ap-upgrade-pipeline:
-    name: AP Upgrade (Pre-Val → Upgrade → Stabilize → Post-Val)
+    name: AP Upgrade (Upgrade → Stabilize → Post-Val)
     runs-on: ubuntu-latest
     timeout-minutes: 60
     
@@ -57,11 +56,11 @@ jobs:
           echo "✓ All required secrets are configured"
 
       # ============================================================================
-      # STAGE 2: PRE-VALIDATION
+      # STAGE 2: QUICK PRE-VALIDATION (Optional - can skip if PR passed)
       # ============================================================================
-      - name: Pre-validation - Check AP status before upgrade
-        id: pre_validation
-        timeout-minutes: 10
+      - name: Quick AP status check (sanity check before upgrade)
+        id: sanity_check
+        timeout-minutes: 5
         run: |
           python "Dev/AP upgrade/validate_ap_status.py" \
             -c "Dev/AP upgrade/site_list.csv" \
@@ -69,19 +68,20 @@ jobs:
             --env .env
         continue-on-error: true
 
-      - name: Upload pre-validation report
+      - name: Upload sanity check report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pre-validation-report
+          name: sanity-check-report
           path: upgrade_validation_pre_*.txt
           retention-days: 30
           if-no-files-found: ignore
 
-      - name: Fail if pre-validation failed
-        if: steps.pre_validation.outcome == 'failure'
+      - name: Fail if sanity check failed
+        if: steps.sanity_check.outcome == 'failure'
         run: |
-          echo "❌ Pre-validation FAILED. APs may not be in a good state before upgrade."
+          echo "❌ Sanity check FAILED. APs may have changed since PR approval."
+          echo "Please re-run PR validation and re-approve."
           exit 1
 
       # ============================================================================
@@ -119,7 +119,6 @@ jobs:
         id: stabilization
         timeout-minutes: 35
         run: |
-          # First, need to determine target version from CSV
           TARGET_VERSION=$(head -2 "Dev/AP upgrade/site_list.csv" | tail -1 | cut -d',' -f2 | xargs)
           echo "Target version: $TARGET_VERSION"
           
@@ -174,7 +173,7 @@ jobs:
         run: |
           echo "✅ AP Upgrade Pipeline COMPLETED SUCCESSFULLY"
           echo "All stages passed:"
-          echo "  ✓ Pre-validation"
+          echo "  ✓ Sanity check"
           echo "  ✓ Upgrade trigger"
           echo "  ✓ Stabilization"
           echo "  ✓ Post-validation"
@@ -186,9 +185,6 @@ jobs:
           echo "Failed step: Check logs above for details"
           exit 1
 
-      # ============================================================================
-      # CLEANUP: SECURITY
-      # ============================================================================
       - name: Cleanup sensitive files
         if: always()
         run: |
