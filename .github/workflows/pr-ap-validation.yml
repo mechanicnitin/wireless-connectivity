@@ -7,6 +7,10 @@ on:
     paths:
       - 'Dev/AP upgrade/site_list.csv'
 
+permissions:
+  contents: read
+  pull-requests: write
+
 jobs:
   ap-validation-check:
     name: Validate AP Status (Pre-Check)
@@ -70,38 +74,10 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      - name: Comment PR with validation result
-        if: always()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const files = fs.readdirSync('.').filter(f => f.startsWith('upgrade_validation_pre_'));
-            
-            if (files.length === 0) {
-              github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: '⚠️ Pre-validation check could not be completed. Please check logs.'
-              });
-              return;
-            }
-
-            const report = fs.readFileSync(files[0], 'utf8');
-            const summary = report.split('SUMMARY')[1]?.trim() || 'No summary found';
-            
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: `## ✅ AP Pre-Validation Report\n\`\`\`\n${summary}\n\`\`\``
-            });
-
       - name: Fail if pre-validation failed
         if: steps.pre_validation.outcome == 'failure'
         run: |
-          echo "❌ Pre-validation FAILED. APs may not be in a good state."
+          echo "❌ Pre-validation FAILED"
           exit 1
 
       - name: Cleanup sensitive files
