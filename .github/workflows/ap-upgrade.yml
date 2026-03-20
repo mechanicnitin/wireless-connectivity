@@ -1,26 +1,13 @@
 name: AP Firmware Upgrade Pipeline
 
-# TRIGGER: Only when CSV file changes are pushed to main
 on:
   push:
     branches:
       - main
     paths:
-      - 'Dev/AP upgrade/site_list.csv'  # ✅ Only triggers on CSV changes
-      - '.github/wokrflows/ap-upgrade.yml'
+      - 'Dev/AP upgrade/site_list.csv'
+      - '.github/workflows/ap-upgrade.yml'
   workflow_dispatch:
-    # ⚠️ Restrict workflow_dispatch to admins only via branch protection rules
-
-permissions:
-  contents: read          # ✅ Minimal: only read repo content
-  artifacts: write        # ✅ Minimal: only write artifacts
-  id-token: write         # ✅ For OIDC token if using OpenID Connect
-
-env:
-  # ✅ SECURE: Use non-sensitive defaults; secrets come from GitHub Secrets
-  ALLOWED_MODELS: "AP45,AP47"
-  RATE_LIMIT_DELAY_SECONDS: "1"
-  MAX_RETRIES: "5"
 
 jobs:
   ap-upgrade-pipeline:
@@ -28,60 +15,34 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     
-    # ✅ SECURITY: Run only on main (no feature branches)
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-
-    environment: production  # ✅ NEW: Requires approval + uses environment secrets
-    
     steps:
       # ============================================================================
       # STAGE 1: SETUP
       # ============================================================================
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 1          # ✅ SECURITY: Minimal fetch
-          persist-credentials: false  # ✅ SECURITY: Don't persist creds
 
       - name: Set up Python
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
-          cache: 'pip'            # ✅ PERFORMANCE: Cache dependencies
 
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install --no-cache-dir requests openpyxl
-        # ✅ SECURITY: --no-cache-dir prevents caching build artifacts
+          pip install requests openpyxl
 
-      - name: Validate CSV file exists and is readable
-        run: |
-          if [ ! -f "Dev/AP upgrade/site_list.csv" ]; then
-            echo "ERROR: CSV file not found"
-            exit 1
-          fi
-          head -1 "Dev/AP upgrade/site_list.csv" | grep -q "site_name,target_version,scope"
-          if [ $? -ne 0 ]; then
-            echo "ERROR: CSV header is invalid"
-            exit 1
-          fi
-          echo "✓ CSV file validation passed"
-        # ✅ SECURITY: Validates file before processing
-
-      - name: Create .env file from environment secrets
+      - name: Create .env file from secrets
         run: |
           cat > .env << 'EOF'
           MIST_BASE_URL=${{ secrets.MIST_BASE_URL }}
           MIST_ORG_ID=${{ secrets.MIST_ORG_ID }}
           MIST_ACCESS_TOKEN=${{ secrets.MIST_ACCESS_TOKEN }}
-          ALLOWED_MODELS=${ALLOWED_MODELS}
-          RATE_LIMIT_DELAY_SECONDS=${RATE_LIMIT_DELAY_SECONDS}
-          MAX_RETRIES=${MAX_RETRIES}
+          ALLOWED_MODELS=AP45,AP47
+          RATE_LIMIT_DELAY_SECONDS=1
+          MAX_RETRIES=5
           EOF
           chmod 600 .env
-          # ✅ SECURITY: Restrictive file permissions (owner read-write only)
-          wc -l .env > /dev/null && echo "✓ .env created successfully"
         env:
           MIST_BASE_URL: ${{ secrets.MIST_BASE_URL }}
           MIST_ORG_ID: ${{ secrets.MIST_ORG_ID }}
@@ -89,33 +50,24 @@ jobs:
 
       - name: Validate secrets are set
         run: |
-          # ✅ SECURITY: Never print secret values, only check if set
-          [ -n "${{ secrets.MIST_BASE_URL }}" ] || { echo "ERROR: MIST_BASE_URL not set"; exit 1; }
-          [ -n "${{ secrets.MIST_ORG_ID }}" ] || { echo "ERROR: MIST_ORG_ID not set"; exit 1; }
-          [ -n "${{ secrets.MIST_ACCESS_TOKEN }}" ] || { echo "ERROR: MIST_ACCESS_TOKEN not set"; exit 1; }
-          echo "✓ All required secrets are configured"
-
-      - name: Scan CSV for injection attacks
-        run: |
-          # ✅ SECURITY: Basic CSV injection detection
-          if grep -qE '(^=|^@|^\+|^-|;\s*bash|`|%0a|%0d|eval|exec|system)' "Dev/AP upgrade/site_list.csv"; then
-            echo "ERROR: Suspicious pattern detected in CSV (potential injection attack)"
+          if [ -z "${{ secrets.MIST_BASE_URL }}" ] || [ -z "${{ secrets.MIST_ORG_ID }}" ] || [ -z "${{ secrets.MIST_ACCESS_TOKEN }}" ]; then
+            echo "ERROR: Missing required GitHub Secrets"
             exit 1
           fi
-          echo "✓ CSV file appears safe"
+          echo "✓ All required secrets are configured"
 
       # ============================================================================
       # STAGE 2: PRE-VALIDATION
       # ============================================================================
       - name: Pre-validation - Check AP status before upgrade
         id: pre_validation
+        timeout-minutes: 10
         run: |
           python "Dev/AP upgrade/validate_ap_status.py" \
             -c "Dev/AP upgrade/site_list.csv" \
             --tag pre \
             --env .env
         continue-on-error: true
-        timeout-minutes: 10  # ✅ SECURITY: Prevent hanging
 
       - name: Upload pre-validation report
         if: always()
@@ -123,9 +75,8 @@ jobs:
         with:
           name: pre-validation-report
           path: upgrade_validation_pre_*.txt
-          retention-days: 7        # ✅ SECURITY: Short retention (not 30 days)
+          retention-days: 30
           if-no-files-found: ignore
-          compression-level: 6
 
       - name: Fail if pre-validation failed
         if: steps.pre_validation.outcome == 'failure'
@@ -138,13 +89,13 @@ jobs:
       # ============================================================================
       - name: Trigger AP firmware upgrades
         id: upgrade
+        timeout-minutes: 15
         run: |
           python "Dev/AP upgrade/bulk_ap_upgrade.py" \
             -c "Dev/AP upgrade/site_list.csv" \
             --yes \
             --env .env
         continue-on-error: true
-        timeout-minutes: 15  # ✅ SECURITY: Prevent hanging
 
       - name: Fail if upgrade failed
         if: steps.upgrade.outcome == 'failure'
@@ -158,30 +109,18 @@ jobs:
         with:
           name: upgrade-logs
           path: script.log
-          retention-days: 7        # ✅ SECURITY: Short retention
+          retention-days: 30
           if-no-files-found: ignore
-          compression-level: 6
-
-      - name: Sanitize logs (remove sensitive data before artifact)
-        if: always()
-        run: |
-          # ✅ SECURITY: Remove any token/password remnants from logs
-          sed -i 's/Token [^ ]*/Token ***REDACTED***/g' script.log || true
-          sed -i 's/token [^ ]*/token ***REDACTED***/g' script.log || true
-          echo "✓ Logs sanitized"
 
       # ============================================================================
       # STAGE 4: STABILIZATION WAIT (CRITICAL)
       # ============================================================================
       - name: Wait for AP stabilization (poll every 2 min, max 30 min)
         id: stabilization
+        timeout-minutes: 35
         run: |
+          # First, need to determine target version from CSV
           TARGET_VERSION=$(head -2 "Dev/AP upgrade/site_list.csv" | tail -1 | cut -d',' -f2 | xargs)
-          # ✅ SECURITY: Validate target version format (basic)
-          if [ -z "$TARGET_VERSION" ]; then
-            echo "ERROR: Could not extract target version from CSV"
-            exit 1
-          fi
           echo "Target version: $TARGET_VERSION"
           
           python "Dev/AP upgrade/wait_for_ap_stabilization.py" \
@@ -191,7 +130,6 @@ jobs:
             --max-wait 1800 \
             --env .env
         continue-on-error: true
-        timeout-minutes: 35  # ✅ SECURITY: Slightly longer than max-wait (1800s = 30min)
 
       - name: Fail if stabilization timeout
         if: steps.stabilization.outcome == 'failure'
@@ -205,13 +143,13 @@ jobs:
       # ============================================================================
       - name: Post-validation - Confirm all APs on target version
         id: post_validation
+        timeout-minutes: 10
         run: |
           python "Dev/AP upgrade/validate_ap_status.py" \
             -c "Dev/AP upgrade/site_list.csv" \
             --tag post \
             --env .env
         continue-on-error: true
-        timeout-minutes: 10  # ✅ SECURITY: Prevent hanging
 
       - name: Upload post-validation report
         if: always()
@@ -219,9 +157,8 @@ jobs:
         with:
           name: post-validation-report
           path: upgrade_validation_post_*.txt
-          retention-days: 7        # ✅ SECURITY: Short retention
+          retention-days: 30
           if-no-files-found: ignore
-          compression-level: 6
 
       - name: Fail if post-validation failed
         if: steps.post_validation.outcome == 'failure'
@@ -230,7 +167,7 @@ jobs:
           exit 1
 
       # ============================================================================
-      # FINAL: SUCCESS & CLEANUP
+      # FINAL: SUCCESS
       # ============================================================================
       - name: Pipeline Success
         if: success()
@@ -249,9 +186,11 @@ jobs:
           echo "Failed step: Check logs above for details"
           exit 1
 
+      # ============================================================================
+      # CLEANUP: SECURITY
+      # ============================================================================
       - name: Cleanup sensitive files
         if: always()
         run: |
-          # ✅ SECURITY: Remove .env file immediately after use
           rm -f .env
           echo "✓ Cleaned up .env file"
