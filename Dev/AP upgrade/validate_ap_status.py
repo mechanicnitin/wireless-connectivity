@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Validate AP firmware status per site (pre/post-check), driven by Excel.
+Validate AP firmware status per site (pre/post-check), driven by Excel/CSV.
 
 Inputs:
-- Excel columns required: site_name, target_version, scope
+- Excel/CSV columns required: site_name, target_version, scope
 - .env required:
     MIST_BASE_URL
     MIST_ORG_ID
@@ -22,13 +22,19 @@ Tagging:
 - --tag post : labels OK as SUCCESS
 - otherwise  : labels OK as OK
 
+Exit codes:
+- 0: All sites passed validation (OK/BASELINE_OK/SUCCESS)
+- 1: Any site flagged, errored, or all skipped
 
-python validate_ap_status.py -x site_list.xlsx --tag pre
-python validate_ap_status.py -x site_list.xlsx --tag post
+Usage:
+  python validate_ap_status.py -x site_list.xlsx --tag pre
+  python validate_ap_status.py -c site_list.csv --tag post
+  python validate_ap_status.py -x site_list.xlsx
 """
 
 import sys
 import os
+import csv
 import getopt
 import time
 from datetime import datetime
@@ -170,8 +176,36 @@ class MistClient:
 
 
 # ----------------------------
-# Excel
+# Excel & CSV Input
 # ----------------------------
+def read_csv_rows(path: str) -> List[Dict[str, str]]:
+    """Read CSV file with required columns: site_name, target_version, scope"""
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError("CSV is empty")
+
+        required = ["site_name", "target_version", "scope"]
+        missing = [c for c in required if c not in reader.fieldnames]
+        if missing:
+            raise ValueError(f"Missing required column(s): {missing}. Found: {list(reader.fieldnames)}")
+
+        for row_num, row in enumerate(reader, start=2):
+            site_name = (row.get("site_name") or "").strip()
+            if not site_name:
+                continue
+            rows.append({
+                "site_name": site_name,
+                "target_version": (row.get("target_version") or "").strip(),
+                "scope": normalize_scope((row.get("scope") or "").strip()),
+            })
+
+    if not rows:
+        raise ValueError("No valid rows in CSV file")
+    return rows
+
+
 def read_excel_rows(path: str, sheet_name: Optional[str] = None) -> List[Dict[str, str]]:
     wb = load_workbook(filename=path, data_only=True)
     ws = wb[sheet_name] if sheet_name else wb.worksheets[0]
@@ -206,6 +240,9 @@ def read_excel_rows(path: str, sheet_name: Optional[str] = None) -> List[Dict[st
                 "scope": normalize_scope(str(scope).strip() if scope is not None else "all"),
             }
         )
+
+    if not out:
+        raise ValueError("No valid rows in Excel sheet")
     return out
 
 
@@ -322,14 +359,35 @@ def evaluate_site(
 # ----------------------------
 def usage():
     print(
-        "Usage:\n"
-        "  python Validate_ap_status.py -x site_list.xlsx [--env .env] [--sheet Sheet1] [--tag pre|post]\n"
+        """
+Validate AP Firmware Status (Pre/Post Upgrade Check)
+
+Required (one of):
+  -x, --excel=        Excel file (.xlsx) with site_name, target_version, scope columns
+  -c, --csv=          CSV file (.csv) with site_name, target_version, scope columns
+
+Optional:
+  -e, --env=          Env file path (default: ./.env)
+  --sheet=            Sheet name (Excel only, default: first sheet)
+  --tag=              Tag for reporting (pre|post, default: none)
+                      pre  → labels OK as BASELINE_OK
+                      post → labels OK as SUCCESS
+
+Exit codes:
+  0: All sites OK/BASELINE_OK/SUCCESS
+  1: Any site FLAGGED, errored, or all sites SKIPPED
+
+Example:
+  python validate_ap_status.py -x site_list.xlsx --tag pre
+  python validate_ap_status.py -c site_list.csv --tag post
+"""
     )
     sys.exit(1)
 
 
 def main():
-    excel_path: Optional[str] = None
+    input_file: Optional[str] = None
+    input_format = "xlsx"  # "xlsx" or "csv"
     env_path: str = ENV_FILE_DEFAULT
     sheet_name: Optional[str] = None
     tag: str = ""
@@ -337,18 +395,22 @@ def main():
     try:
         opts, _ = getopt.getopt(
             sys.argv[1:],
-            "hx:e:",
-            ["help", "sheet=", "tag=", "env="],
+            "hx:c:e:",
+            ["help", "sheet=", "tag=", "env=", "excel=", "csv="],
         )
     except getopt.GetoptError as err:
-        print(err)
+        print(f"Error: {err}")
         usage()
 
     for o, a in opts:
         if o in ("-h", "--help"):
             usage()
-        elif o == "-x":
-            excel_path = a
+        elif o in ("-x", "--excel"):
+            input_file = a
+            input_format = "xlsx"
+        elif o in ("-c", "--csv"):
+            input_file = a
+            input_format = "csv"
         elif o in ("--env", "-e"):
             env_path = a
         elif o == "--sheet":
@@ -356,16 +418,24 @@ def main():
         elif o == "--tag":
             tag = a.strip().lower()
 
-    if not excel_path:
+    if not input_file:
+        print("Error: Input file is required (-x/--excel or -c/--csv)")
         usage()
 
-    env = load_env_file(env_path)
+    # Load environment
+    try:
+        env = load_env_file(env_path)
+    except Exception as e:
+        print(f"ERROR: Failed to load env file: {e}")
+        sys.exit(1)
+
     base_url = env.get("MIST_BASE_URL")
     org_id = env.get("MIST_ORG_ID")
     token = env.get("MIST_ACCESS_TOKEN")
 
     if not base_url or not org_id or not token:
-        raise RuntimeError("Missing MIST_BASE_URL and/or MIST_ORG_ID and/or MIST_ACCESS_TOKEN in .env")
+        print("ERROR: Missing MIST_BASE_URL, MIST_ORG_ID, or MIST_ACCESS_TOKEN in .env")
+        sys.exit(1)
 
     allowed_models = parse_allowed_models(env)
     max_retries = parse_int(env, "MAX_RETRIES", 5)
@@ -374,6 +444,7 @@ def main():
     proxies = {"http": proxy, "https": proxy} if proxy else None
     no_proxy = env.get("NO_PROXY")
 
+    # Initialize Mist client
     client = MistClient(
         base_url=base_url,
         token=token,
@@ -382,9 +453,24 @@ def main():
         max_retries=max_retries,
     )
 
-    rows = read_excel_rows(excel_path, sheet_name=sheet_name)
-    site_map = build_site_map(client, org_id)
+    # Read input file
+    try:
+        if input_format == "csv":
+            rows = read_csv_rows(input_file)
+        else:
+            rows = read_excel_rows(input_file, sheet_name=sheet_name)
+    except Exception as e:
+        print(f"ERROR: Failed to read input file: {e}")
+        sys.exit(1)
 
+    # Build site map
+    try:
+        site_map = build_site_map(client, org_id)
+    except Exception as e:
+        print(f"ERROR: Failed to load sites from Mist: {e}")
+        sys.exit(1)
+
+    # Generate report
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag_part = f"_{tag}" if tag else ""
     report_path = f"upgrade_validation{tag_part}_{stamp}.txt"
@@ -393,7 +479,7 @@ def main():
     lines.append(f"Upgrade Validation Report{(' (' + tag + ')') if tag else ''}")
     lines.append(f"Generated: {datetime.now().isoformat(timespec='seconds')}")
     lines.append(f"Allowed models: {', '.join(allowed_models)}")
-    lines.append(f"Excel: {excel_path}")
+    lines.append(f"Input file: {input_file}")
     lines.append("-" * 80)
 
     total = ok = flagged = skipped = 0
@@ -456,10 +542,41 @@ def main():
     lines.append(f"  SKIPPED: {skipped}")
     lines.append(f"  Report file: {report_path}")
 
-    with open(report_path, "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    # Write report
+    try:
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        print(f"✓ Validation complete. Report saved to: {report_path}")
+    except Exception as e:
+        print(f"ERROR: Failed to write report: {e}")
+        sys.exit(1)
 
-    print(f"Validation complete. Report saved to: {report_path}")
+    # Print summary to console
+    print("\n" + "=" * 80)
+    print("SUMMARY")
+    print("=" * 80)
+    print(f"  Sites processed: {total}")
+    print(f"  {ok_word}: {ok}")
+    print(f"  FLAGGED: {flagged}")
+    print(f"  SKIPPED: {skipped}")
+    print("=" * 80)
+
+    # Determine exit code
+    # Fail if any sites flagged, OR all sites skipped (likely config issue)
+    if flagged > 0:
+        print(f"\n❌ FAILED: {flagged} site(s) flagged")
+        sys.exit(1)
+
+    if skipped == total and total > 0:
+        print(f"\n⚠️  WARNING: All {total} site(s) were skipped (possible configuration issue)")
+        sys.exit(1)
+
+    if ok > 0:
+        print(f"\n✅ SUCCESS: All {ok} site(s) validated successfully")
+        sys.exit(0)
+
+    print("\n⚠️  No sites were processed")
+    sys.exit(0)
 
 
 if __name__ == "__main__":
