@@ -65,7 +65,6 @@ jobs:
         id: pre_validation
         run: |
           python "Dev/AP upgrade/validate_ap_status.py" \
-            -x "Dev/AP upgrade/site_list.csv" \
             -c "Dev/AP upgrade/site_list.csv" \
             --tag pre \
             --env .env
@@ -73,11 +72,12 @@ jobs:
 
       - name: Upload pre-validation report
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: validation-reports
           path: upgrade_validation_pre_*.txt
           retention-days: 30
+          if-no-files-found: ignore
 
       - name: Fail if pre-validation failed
         if: steps.pre_validation.outcome == 'failure'
@@ -105,11 +105,12 @@ jobs:
 
       - name: Upload upgrade logs
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: upgrade-logs
           path: script.log
           retention-days: 30
+          if-no-files-found: ignore
 
       # ============================================================================
       # STAGE 4: STABILIZATION WAIT (CRITICAL)
@@ -150,11 +151,12 @@ jobs:
 
       - name: Upload post-validation report
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: validation-reports
           path: upgrade_validation_post_*.txt
           retention-days: 30
+          if-no-files-found: ignore
 
       - name: Fail if post-validation failed
         if: steps.post_validation.outcome == 'failure'
