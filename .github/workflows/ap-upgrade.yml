@@ -4,8 +4,6 @@ on:
   push:
     branches:
       - main
-    paths:
-      - 'Dev/AP upgrade/site_list.csv'
   workflow_dispatch:
 
 jobs:
@@ -20,18 +18,41 @@ jobs:
       # ============================================================================
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 2  # Need 2 commits to compare
+
+      - name: Check if CSV was modified
+        id: csv_check
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "modified=true" >> $GITHUB_OUTPUT
+            echo "ℹ️ Manual trigger - proceeding with upgrade"
+          elif git diff HEAD~1 HEAD --name-only | grep -q "Dev/AP upgrade/site_list.csv"; then
+            echo "modified=true" >> $GITHUB_OUTPUT
+            echo "✓ CSV file modified - proceeding with upgrade"
+          else
+            echo "modified=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ CSV file not modified - skipping upgrade"
+          fi
+
+      - name: Skip if CSV not modified
+        if: steps.csv_check.outputs.modified == 'false'
+        run: exit 0
 
       - name: Set up Python
+        if: steps.csv_check.outputs.modified == 'true'
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
       - name: Install Python dependencies
+        if: steps.csv_check.outputs.modified == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install requests openpyxl
 
       - name: Create .env file from secrets
+        if: steps.csv_check.outputs.modified == 'true'
         run: |
           cat > .env << 'EOF'
           MIST_BASE_URL=${{ secrets.MIST_BASE_URL }}
@@ -48,6 +69,7 @@ jobs:
           MIST_ACCESS_TOKEN: ${{ secrets.MIST_ACCESS_TOKEN }}
 
       - name: Validate secrets are set
+        if: steps.csv_check.outputs.modified == 'true'
         run: |
           if [ -z "${{ secrets.MIST_BASE_URL }}" ] || [ -z "${{ secrets.MIST_ORG_ID }}" ] || [ -z "${{ secrets.MIST_ACCESS_TOKEN }}" ]; then
             echo "ERROR: Missing required GitHub Secrets"
@@ -59,6 +81,7 @@ jobs:
       # STAGE 2: QUICK PRE-VALIDATION (Optional - can skip if PR passed)
       # ============================================================================
       - name: Quick AP status check (sanity check before upgrade)
+        if: steps.csv_check.outputs.modified == 'true'
         id: sanity_check
         timeout-minutes: 5
         run: |
@@ -69,7 +92,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload sanity check report
-        if: always()
+        if: always() && steps.csv_check.outputs.modified == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: sanity-check-report
@@ -88,6 +111,7 @@ jobs:
       # STAGE 3: UPGRADE
       # ============================================================================
       - name: Trigger AP firmware upgrades
+        if: steps.csv_check.outputs.modified == 'true'
         id: upgrade
         timeout-minutes: 15
         run: |
@@ -104,7 +128,7 @@ jobs:
           exit 1
 
       - name: Upload upgrade logs
-        if: always()
+        if: always() && steps.csv_check.outputs.modified == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: upgrade-logs
@@ -116,6 +140,7 @@ jobs:
       # STAGE 4: STABILIZATION WAIT (CRITICAL)
       # ============================================================================
       - name: Wait for AP stabilization (poll every 2 min, max 30 min)
+        if: steps.csv_check.outputs.modified == 'true'
         id: stabilization
         timeout-minutes: 35
         run: |
@@ -141,6 +166,7 @@ jobs:
       # STAGE 5: POST-VALIDATION
       # ============================================================================
       - name: Post-validation - Confirm all APs on target version
+        if: steps.csv_check.outputs.modified == 'true'
         id: post_validation
         timeout-minutes: 10
         run: |
@@ -151,7 +177,7 @@ jobs:
         continue-on-error: true
 
       - name: Upload post-validation report
-        if: always()
+        if: always() && steps.csv_check.outputs.modified == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: post-validation-report
@@ -169,7 +195,7 @@ jobs:
       # FINAL: SUCCESS
       # ============================================================================
       - name: Pipeline Success
-        if: success()
+        if: success() && steps.csv_check.outputs.modified == 'true'
         run: |
           echo "✅ AP Upgrade Pipeline COMPLETED SUCCESSFULLY"
           echo "All stages passed:"
@@ -179,14 +205,14 @@ jobs:
           echo "  ✓ Post-validation"
 
       - name: Pipeline Failure Summary
-        if: failure()
+        if: failure() && steps.csv_check.outputs.modified == 'true'
         run: |
           echo "❌ AP Upgrade Pipeline FAILED"
           echo "Failed step: Check logs above for details"
           exit 1
 
       - name: Cleanup sensitive files
-        if: always()
+        if: always() && steps.csv_check.outputs.modified == 'true'
         run: |
           rm -f .env
           echo "✓ Cleaned up .env file"
