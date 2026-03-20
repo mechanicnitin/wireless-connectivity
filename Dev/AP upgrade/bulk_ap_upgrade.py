@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bulk AP upgrade (immediate) driven by an Excel sheet.
+Bulk AP upgrade (immediate) driven by Excel/CSV sheet.
 
 A) Pre-check skip if already on target version (per scope + allowed models)
 B) Model targeting guard (default AP45; extend via .env ALLOWED_MODELS=AP45,AP47)
@@ -11,14 +11,15 @@ Inputs:
     MIST_BASE_URL, MIST_ORG_ID, MIST_ACCESS_TOKEN
     Proxy: ALL_PROXY or HTTPS_PROXY/HTTP_PROXY, and NO_PROXY
 
-- Excel columns required:
+- Excel/CSV columns required:
     site_name, target_version, scope
   scope values:
     all | connected
 
 Usage:
   python bulk_ap_upgrade.py -x site_list.xlsx --dry_run --preflight
-  python bulk_ap_upgrade.py -x site_list.xlsx 
+  python bulk_ap_upgrade.py -x site_list.xlsx --yes
+  python bulk_ap_upgrade.py -c site_list.csv --yes
 """
 
 import sys
@@ -27,6 +28,7 @@ import json
 import getopt
 import logging
 import time
+import csv
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -34,10 +36,12 @@ from openpyxl import load_workbook
 
 LOG_FILE = "./script.log"
 ENV_FILE = ".env"
-EXCEL_FILE: Optional[str] = None
+INPUT_FILE: Optional[str] = None
 SHEET_NAME: Optional[str] = None
 DRY_RUN = False
 DO_PREFLIGHT = False
+AUTO_YES = False
+INPUT_FORMAT = "xlsx"  # "xlsx" or "csv"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -83,6 +87,31 @@ def normalize_scope(scope: str) -> str:
     if s in ("connected", "connected_only", "online"):
         return "connected"
     raise ValueError(f"Invalid scope '{scope}'. Use 'all' or 'connected'.")
+
+
+def read_csv_rows(path: str) -> List[Dict[str, str]]:
+    """Read CSV file with required columns: site_name, target_version, scope"""
+    rows = []
+    with open(path, "r", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if reader.fieldnames is None:
+            raise ValueError("CSV is empty")
+        
+        required = ["site_name", "target_version", "scope"]
+        missing = [c for c in required if c not in reader.fieldnames]
+        if missing:
+            raise ValueError(f"Missing required column(s): {missing}. Found: {reader.fieldnames}")
+        
+        for row_num, row in enumerate(reader, start=2):
+            site_name = (row.get("site_name") or "").strip()
+            if not site_name:
+                continue
+            rows.append({
+                "site_name": site_name,
+                "target_version": (row.get("target_version") or "").strip(),
+                "scope": (row.get("scope") or "").strip(),
+            })
+    return rows
 
 
 def read_excel_rows(path: str, sheet_name: Optional[str]) -> List[Dict[str, str]]:
@@ -163,7 +192,6 @@ class MistClient:
         self.max_retries = max_retries
 
         self.session = requests.Session()
-        # We control proxy explicitly; avoid system-proxy surprises.
         self.session.trust_env = False
 
         self.session.headers.update(
@@ -192,7 +220,6 @@ class MistClient:
                 return
             except Exception:
                 pass
-        # exponential backoff with jitter-ish (simple)
         delay = min(30, (2 ** attempt))
         time.sleep(delay)
 
@@ -211,7 +238,6 @@ class MistClient:
                     timeout=self.timeout,
                 )
 
-                # Retryable status codes
                 if resp.status_code in (429, 500, 502, 503, 504):
                     retry_after = resp.headers.get("Retry-After")
                     if attempt < self.max_retries:
@@ -239,7 +265,6 @@ class MistClient:
                 last_err = e
                 raise
 
-        # should never reach
         if last_err:
             raise last_err
         raise RuntimeError(f"{method} {path} failed unexpectedly")
@@ -292,9 +317,6 @@ def resolve_site_id(site_name: str, mapping: Dict[str, List[Tuple[str, str]]]) -
 
 
 def get_site_devices_stats(client: MistClient, site_id: str) -> List[Dict[str, Any]]:
-    """
-    Returns list of device stats from GET /sites/:site_id/stats/devices
-    """
     data = client.request("GET", f"/sites/{site_id}/stats/devices")
     return data if isinstance(data, list) else []
 
@@ -315,9 +337,6 @@ def get_device_id(device: Dict[str, Any]) -> Optional[str]:
 
 
 def get_device_version(device: Dict[str, Any]) -> Optional[str]:
-    """
-    Firmware/version field names can vary; try a few common ones.
-    """
     for key in ("version", "firmware_version", "firmware", "sw_version"):
         v = device.get(key)
         if isinstance(v, str) and v.strip():
@@ -330,11 +349,6 @@ def select_target_ap_device_ids(
     scope: str,
     allowed_models: List[str],
 ) -> List[str]:
-    """
-    Select AP device IDs for upgrade based on scope + allowed models.
-    - scope=all: all allowed-model devices in the site (connected or not)
-    - scope=connected: only allowed-model devices that are currently connected
-    """
     out: List[str] = []
     for d in devices:
         if not is_allowed_model(d, allowed_models):
@@ -352,11 +366,6 @@ def precheck_already_on_target(
     target_device_ids: List[str],
     target_version: str,
 ) -> Tuple[bool, int, int]:
-    """
-    Returns (all_on_target, known_count, total_targeted)
-    - If we cannot determine version for some devices, we treat them as not-confirmed
-      => we will NOT skip (fail-open).
-    """
     target_set = set(target_device_ids)
     known = 0
     on_target = 0
@@ -375,9 +384,9 @@ def precheck_already_on_target(
             on_target += 1
 
     if total == 0:
-        return False, known, total  # nothing targeted -> don't skip (we'll handle separately)
+        return False, known, total
     if known < total:
-        return False, known, total  # can't confirm all -> don't skip
+        return False, known, total
     return on_target == total, known, total
 
 
@@ -389,15 +398,10 @@ def upgrade_site(
     devices_stats: List[Dict[str, Any]],
     allowed_models: List[str],
 ) -> Dict[str, Any]:
-    """
-    POST /sites/:site_id/devices/upgrade with payload.
-    We always send explicit device_ids selected by (scope + allowed_models),
-    to ensure we only target AP45/AP47 etc even if other device types exist.
-    """
     device_ids = select_target_ap_device_ids(devices_stats, scope, allowed_models)
     payload: Dict[str, Any] = {
         "version": version,
-        "enable_p2p": False,  # deterministic default
+        "enable_p2p": False,
         "device_ids": device_ids,
     }
     return client.request("POST", f"/sites/{site_id}/devices/upgrade", payload=payload)
@@ -406,19 +410,21 @@ def upgrade_site(
 def usage():
     print(
         """
-Bulk AP Upgrade from Excel (Immediate)
+Bulk AP Upgrade from Excel/CSV (Immediate)
 
-Required:
+Required (one of):
   -x, --excel=        Excel file path (.xlsx)
+  -c, --csv=          CSV file path (.csv)
 
 Optional:
   -e, --env=          Env file path (default: ./.env)
   -l, --log_file=     Log file path (default: ./script.log)
-  --sheet=            Sheet name (default: first sheet)
+  --sheet=            Sheet name (default: first sheet, Excel only)
   --dry_run           Don't call upgrade API; only validate & show plan
   --preflight         Do a quick API call to validate proxy/auth before processing
+  --yes               Automatically proceed with upgrades (non-interactive)
 
-Excel columns required:
+File columns required:
   site_name, target_version, scope
 
 scope values:
@@ -431,7 +437,8 @@ Env optional:
 
 Example:
   python bulk_ap_upgrade.py -x site_list.xlsx --dry_run --preflight
-  python bulk_ap_upgrade.py -x site_list.xlsx
+  python bulk_ap_upgrade.py -c site_list.csv --yes
+  python bulk_ap_upgrade.py -x site_list.xlsx --yes
 """
     )
     sys.exit(0)
@@ -441,8 +448,8 @@ if __name__ == "__main__":
     try:
         opts, _ = getopt.getopt(
             sys.argv[1:],
-            "hx:e:l:",
-            ["help", "excel=", "env=", "log_file=", "sheet=", "dry_run", "preflight"],
+            "hx:c:e:l:",
+            ["help", "excel=", "csv=", "env=", "log_file=", "sheet=", "dry_run", "preflight", "yes"],
         )
     except getopt.GetoptError as err:
         console.error(str(err))
@@ -452,7 +459,11 @@ if __name__ == "__main__":
         if o in ("-h", "--help"):
             usage()
         elif o in ("-x", "--excel"):
-            EXCEL_FILE = a
+            INPUT_FILE = a
+            INPUT_FORMAT = "xlsx"
+        elif o in ("-c", "--csv"):
+            INPUT_FILE = a
+            INPUT_FORMAT = "csv"
         elif o in ("-e", "--env"):
             ENV_FILE = a
         elif o in ("-l", "--log_file"):
@@ -463,9 +474,11 @@ if __name__ == "__main__":
             DRY_RUN = True
         elif o == "--preflight":
             DO_PREFLIGHT = True
+        elif o == "--yes":
+            AUTO_YES = True
 
-    if not EXCEL_FILE:
-        console.critical("Excel file is required (-x / --excel).")
+    if not INPUT_FILE:
+        console.critical("Input file is required (-x / --excel or -c / --csv).")
         usage()
 
     logging.basicConfig(filename=LOG_FILE, filemode="w")
@@ -489,7 +502,6 @@ if __name__ == "__main__":
     rate_delay = parse_float(env, "RATE_LIMIT_DELAY_SECONDS", 1.0)
     max_retries = parse_int(env, "MAX_RETRIES", 5)
 
-    # Proxy config from .env
     proxy = env.get("ALL_PROXY") or env.get("HTTPS_PROXY") or env.get("HTTP_PROXY")
     proxies = {"http": proxy, "https": proxy} if proxy else None
     no_proxy = env.get("NO_PROXY")
@@ -519,15 +531,18 @@ if __name__ == "__main__":
             console.critical("Check proxy reachability, credentials, and whether proxy requires auth.")
             sys.exit(1)
 
-    # Read Excel
+    # Read input file
     try:
-        rows = read_excel_rows(EXCEL_FILE, SHEET_NAME)
+        if INPUT_FORMAT == "csv":
+            rows = read_csv_rows(INPUT_FILE)
+        else:
+            rows = read_excel_rows(INPUT_FILE, SHEET_NAME)
     except Exception as e:
-        console.critical(f"Failed to read Excel: {e}")
+        console.critical(f"Failed to read input file: {e}")
         sys.exit(1)
 
     if not rows:
-        console.critical("No usable rows found in Excel.")
+        console.critical("No usable rows found in input file.")
         sys.exit(1)
 
     # Build site lookup
@@ -540,7 +555,6 @@ if __name__ == "__main__":
     plan: List[Dict[str, Any]] = []
     errors: List[str] = []
 
-    # excel_row_num starts at 2 to align with Excel row numbers (row 1 header)
     for excel_row_num, r in enumerate(rows, start=2):
         site_name = r["site_name"]
         version = r["target_version"]
@@ -564,14 +578,14 @@ if __name__ == "__main__":
         plan.append(
             {
                 "row": excel_row_num,
-                "site_name": msg,  # resolved canonical name
+                "site_name": msg,
                 "site_id": site_id,
                 "target_version": version,
                 "scope": scope,
             }
         )
 
-    console.info(f"Loaded {len(rows)} row(s) from Excel.")
+    console.info(f"Loaded {len(rows)} row(s) from input file.")
     console.info(f"Planned upgrades: {len(plan)} site(s). Errors: {len(errors)}.")
 
     if errors:
@@ -592,10 +606,11 @@ if __name__ == "__main__":
         console.info("DRY RUN enabled. No upgrades were triggered.")
         sys.exit(0)
 
-    resp = input(f"\nProceed to trigger upgrades for {len(plan)} site(s)? (y/N) ")
-    if resp.strip().lower() != "y":
-        console.info("Cancelled.")
-        sys.exit(0)
+    if not AUTO_YES:
+        resp = input(f"\nProceed to trigger upgrades for {len(plan)} site(s)? (y/N) ")
+        if resp.strip().lower() != "y":
+            console.info("Cancelled.")
+            sys.exit(0)
 
     success = 0
     failed = 0
@@ -607,7 +622,6 @@ if __name__ == "__main__":
         version = p["target_version"]
         scope = p["scope"]
 
-        # Rate limit pacing between sites
         if idx > 1 and rate_delay > 0:
             time.sleep(rate_delay)
 
@@ -641,3 +655,8 @@ if __name__ == "__main__":
             failed += 1
 
     console.info(f"\nDone. Success={success}, Skipped={skipped}, Failed={failed}. Log: {LOG_FILE}")
+    
+    # Exit with proper exit code
+    if failed > 0:
+        sys.exit(1)
+    sys.exit(0)
