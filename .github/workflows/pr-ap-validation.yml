@@ -4,60 +4,70 @@ on:
   pull_request:
     branches:
       - main
-    paths:
-      - 'Dev/AP upgrade/site_list.csv'
 
 permissions:
   contents: read
   pull-requests: write
 
 jobs:
-  ap-validation-check:
-    name: Validate AP Status (Pre-Check)
+  validation:
+    name: validation
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if CSV was modified
+        id: check_csv
+        run: |
+          if git diff origin/main...HEAD --name-only | grep -q "Dev/AP upgrade/site_list.csv"; then
+            echo "csv_modified=true" >> $GITHUB_OUTPUT
+            echo "✅ CSV file was modified"
+          else
+            echo "csv_modified=false" >> $GITHUB_OUTPUT
+            echo "⏭️ CSV file was NOT modified - skipping validation"
+          fi
 
       - name: Set up Python
+        if: steps.check_csv.outputs.csv_modified == 'true'
         uses: actions/setup-python@v4
         with:
           python-version: '3.11'
 
-      - name: Install Python dependencies
+      - name: Install dependencies
+        if: steps.check_csv.outputs.csv_modified == 'true'
         run: |
           python -m pip install --upgrade pip
           pip install requests openpyxl
 
-      - name: Create .env file from secrets
+      - name: Create .env file
+        if: steps.check_csv.outputs.csv_modified == 'true'
         run: |
           cat > .env << 'EOF'
           MIST_BASE_URL=${{ secrets.MIST_BASE_URL }}
           MIST_ORG_ID=${{ secrets.MIST_ORG_ID }}
           MIST_ACCESS_TOKEN=${{ secrets.MIST_ACCESS_TOKEN }}
-          ALLOWED_MODELS=AP45,AP47
+          ALLOWED_MODELS=AP45
           RATE_LIMIT_DELAY_SECONDS=1
           MAX_RETRIES=5
           EOF
           chmod 600 .env
-        env:
-          MIST_BASE_URL: ${{ secrets.MIST_BASE_URL }}
-          MIST_ORG_ID: ${{ secrets.MIST_ORG_ID }}
-          MIST_ACCESS_TOKEN: ${{ secrets.MIST_ACCESS_TOKEN }}
 
-      - name: Validate secrets are set
+      - name: Validate secrets
+        if: steps.check_csv.outputs.csv_modified == 'true'
         run: |
-          if [ -z "${{ secrets.MIST_BASE_URL }}" ] || [ -z "${{ secrets.MIST_ORG_ID }}" ] || [ -z "${{ secrets.MIST_ACCESS_TOKEN }}" ]; then
-            echo "ERROR: Missing required GitHub Secrets"
-            exit 1
-          fi
-          echo "✓ All required secrets are configured"
+          [ -n "${{ secrets.MIST_BASE_URL }}" ] || { echo "ERROR: MIST_BASE_URL not set"; exit 1; }
+          [ -n "${{ secrets.MIST_ORG_ID }}" ] || { echo "ERROR: MIST_ORG_ID not set"; exit 1; }
+          [ -n "${{ secrets.MIST_ACCESS_TOKEN }}" ] || { echo "ERROR: MIST_ACCESS_TOKEN not set"; exit 1; }
+          echo "✓ All secrets configured"
 
-      - name: Pre-validation - Check AP status before upgrade
-        id: pre_validation
-        timeout-minutes: 10
+      - name: Run pre-validation
+        if: steps.check_csv.outputs.csv_modified == 'true'
+        id: validation
         run: |
           python "Dev/AP upgrade/validate_ap_status.py" \
             -c "Dev/AP upgrade/site_list.csv" \
@@ -65,8 +75,8 @@ jobs:
             --env .env
         continue-on-error: true
 
-      - name: Upload pre-validation report
-        if: always()
+      - name: Upload report
+        if: always() && steps.check_csv.outputs.csv_modified == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: pr-validation-report
@@ -74,14 +84,17 @@ jobs:
           retention-days: 7
           if-no-files-found: ignore
 
-      - name: Fail if pre-validation failed
-        if: steps.pre_validation.outcome == 'failure'
+      - name: Fail if validation failed
+        if: steps.validation.outcome == 'failure'
         run: |
           echo "❌ Pre-validation FAILED"
           exit 1
 
-      - name: Cleanup sensitive files
-        if: always()
+      - name: Success message
+        if: steps.validation.outcome == 'success'
         run: |
-          rm -f .env
-          echo "✓ Cleaned up .env file"
+          echo "✅ Pre-validation PASSED"
+
+      - name: Cleanup
+        if: always()
+        run: rm -f .env
