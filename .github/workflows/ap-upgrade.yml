@@ -154,14 +154,23 @@ jobs:
         continue-on-error: true
 
       - name: Upload post-validation report
-        if: always()
+        if: always() && steps.post_validation.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
           name: post-validation-report
           path: upgrade_validation_post_*.txt
           retention-days: 30
-          if-no-files-found: ignore
+          if-no-files-found: warn  # ← Change from ignore to warn
 
+      - name: List generated files
+        if: always()
+        run: |
+          echo "Files in workspace:"
+          ls -la | grep upgrade_validation || echo "No validation files found"
+          echo ""
+          echo "All log files:"
+          find . -name "*.txt" -o -name "*.log" 2>/dev/null | head -20
+        
       - name: Fail if post-validation failed
         if: steps.post_validation.outcome == 'failure'
         run: |
