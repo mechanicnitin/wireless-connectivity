@@ -42,7 +42,7 @@ jobs:
           MIST_BASE_URL=${{ secrets.MIST_BASE_URL }}
           MIST_ORG_ID=${{ secrets.MIST_ORG_ID }}
           MIST_ACCESS_TOKEN=${{ secrets.MIST_ACCESS_TOKEN }}
-          ALLOWED_MODELS=AP45,AP47
+          ALLOWED_MODELS=AP45
           RATE_LIMIT_DELAY_SECONDS=1
           MAX_RETRIES=5
           EOF
