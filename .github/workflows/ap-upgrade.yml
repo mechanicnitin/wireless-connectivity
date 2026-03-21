@@ -119,20 +119,14 @@ jobs:
       # ============================================================================
       # STAGE 4: STABILIZATION WAIT (CRITICAL)
       # ============================================================================
-      - name: Wait for AP stabilization (poll every 2 min, max 30 min)
-        id: stabilization
-        timeout-minutes: 35
+      - name: Wait for AP stabilization
         run: |
-          TARGET_VERSION=$(head -2 "Dev/AP upgrade/site_list.csv" | tail -1 | cut -d',' -f2 | xargs)
-          echo "Target version: $TARGET_VERSION"
-          
+          SCOPE=$(head -2 "Dev/AP upgrade/site_list.csv" | tail -1 | cut -d',' -f3 | xargs)
           python "Dev/AP upgrade/wait_for_ap_stabilization.py" \
             -c "Dev/AP upgrade/site_list.csv" \
             --target-version "$TARGET_VERSION" \
-            --poll-interval 120 \
-            --max-wait 1800 \
+            --scope "$SCOPE" \
             --env .env
-        continue-on-error: true
 
       - name: Fail if stabilization timeout
         if: steps.stabilization.outcome == 'failure'
