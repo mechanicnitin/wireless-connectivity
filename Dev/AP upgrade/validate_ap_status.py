@@ -11,6 +11,7 @@ Inputs:
 
 Reporting rules (as requested):
   OK | <site> | eligible=<n> | target=<ver> | scope=<scope>
+    - <ap> [<model>] status=<status> version=<version>  OK
 - FLAGGED sites: summary line + only problematic APs
   FLAGGED | <site> | eligible=<n> | mismatched=<n> | disconnected=<n> | upgrading=<n>
     - <ap> [<model>] status=<status> version=<version>  <issue1>; <issue2>
@@ -305,10 +306,11 @@ def evaluate_site(
     target_version: str,
     scope: str,
     allowed_models: List[str],
-) -> Tuple[int, List[Tuple[Dict[str, Any], List[str]]], Dict[str, int], str]:
+) -> Tuple[int, List[Dict[str, Any]], List[Tuple[Dict[str, Any], List[str]]], Dict[str, int], str]:
     """
     Returns:
       eligible_count,
+      eligible_devices (all eligible, for full visibility),
       flagged_devices (device, issues),
       counts dict,
       skipped_reason ("" if not skipped)
@@ -325,7 +327,7 @@ def evaluate_site(
         eligible.append(d)
 
     if not eligible:
-        return 0, [], {"mismatched": 0, "disconnected": 0, "upgrading": 0}, "no eligible APs"
+        return 0, [], [], {"mismatched": 0, "disconnected": 0, "upgrading": 0}, "no eligible APs"
 
     flagged: List[Tuple[Dict[str, Any], List[str]]] = []
     counts = {"mismatched": 0, "disconnected": 0, "upgrading": 0}
@@ -351,7 +353,7 @@ def evaluate_site(
         if issues:
             flagged.append((d, issues))
 
-    return len(eligible), flagged, counts, ""
+    return len(eligible), eligible, flagged, counts, ""
 
 
 # ----------------------------
@@ -504,7 +506,7 @@ def main():
 
         try:
             devices = get_site_devices(client, site_id)
-            eligible_count, flagged_devices, counts, skip_reason = evaluate_site(
+            eligible_count, eligible_devices, flagged_devices, counts, skip_reason = evaluate_site(
                 devices, target_version, scope, allowed_models
             )
 
@@ -517,6 +519,12 @@ def main():
                 lines.append(
                     f"{ok_word} | {site_name} | eligible={eligible_count} | target={target_version} | scope={scope}"
                 )
+                # ✅ FIX #1 & #2: Show ALL eligible APs (full visibility) even when baseline_ok/success
+                for d in eligible_devices:
+                    lines.append(
+                        f"  - {device_name(d)} [{device_model(d)}] status={device_status(d)} "
+                        f"version={device_version(d)}  OK"
+                    )
                 ok += 1
             else:
                 lines.append(
