@@ -119,14 +119,19 @@ jobs:
       # ============================================================================
       # STAGE 4: STABILIZATION WAIT (CRITICAL)
       # ============================================================================
+      - name: Extract target version from CSV
+        id: extract_version
+        run: |
+          TARGET_VERSION=$(head -2 "Dev/AP upgrade/site_list.csv" | tail -1 | cut -d',' -f2 | xargs)
+          echo "target_version=$TARGET_VERSION" >> $GITHUB_OUTPUT
+          echo "✓ Extracted target version: $TARGET_VERSION"
+          
       - name: Wait for AP stabilization
         id: stabilization
-        env:
-          TARGET_VERSION: $(head -2 "Dev/AP upgrade/site_list.csv" | tail -1 | cut -d',' -f2 | xargs)
         run: |
             python "Dev/AP upgrade/wait_for_ap_stabilization.py" \
             -c "Dev/AP upgrade/site_list.csv" \
-            --target-version "$TARGET_VERSION" \
+            --target-version "${{ steps.extract_version.outputs.target_version }}" \
             --env .env
 
       - name: Fail if stabilization timeout
