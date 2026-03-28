@@ -120,8 +120,11 @@ jobs:
       # STAGE 4: STABILIZATION WAIT (CRITICAL)
       # ============================================================================
       - name: Wait for AP stabilization
+        id: stabilization
+        env:
+          TARGET_VERSION: $(head -2 "Dev/AP upgrade/site_list.csv" | tail -1 | cut -d',' -f2 | xargs)
         run: |
-          python "Dev/AP upgrade/wait_for_ap_stabilization.py" \
+            python "Dev/AP upgrade/wait_for_ap_stabilization.py" \
             -c "Dev/AP upgrade/site_list.csv" \
             --target-version "$TARGET_VERSION" \
             --env .env
