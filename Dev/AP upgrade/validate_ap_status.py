@@ -9,14 +9,11 @@ Inputs:
     MIST_ORG_ID
     MIST_ACCESS_TOKEN
 
-Reporting rules (as requested):
-  OK | <site> | eligible=<n> | target=<ver> | scope=<scope>
-    - <ap> [<model>] status=<status> version=<version>  OK
-- FLAGGED sites: summary line + only problematic APs
-  FLAGGED | <site> | eligible=<n> | mismatched=<n> | disconnected=<n> | upgrading=<n>
-    - <ap> [<model>] status=<status> version=<version>  <issue1>; <issue2>
-- SKIPPED sites: single line with reason
-  SKIPPED | <site> | reason=<reason>
+Reporting rules:
+  OK/BASELINE_OK/SUCCESS sites: Show ALL eligible APs (full visibility)
+    - Used for baseline comparison with post-validation
+  FLAGGED sites: Show only problematic APs (issues only)
+  SKIPPED sites: Single line with reason
 
 Tagging:
 - --tag pre  : labels OK as BASELINE_OK
@@ -30,7 +27,6 @@ Exit codes:
 Usage:
   python validate_ap_status.py -x site_list.xlsx --tag pre
   python validate_ap_status.py -c site_list.csv --tag post
-  python validate_ap_status.py -x site_list.xlsx
 """
 
 import sys
@@ -48,9 +44,6 @@ from openpyxl import load_workbook
 ENV_FILE_DEFAULT = ".env"
 
 
-# ----------------------------
-# ENV
-# ----------------------------
 def load_env_file(path: str) -> Dict[str, str]:
     expanded = os.path.expanduser(path)
     if not os.path.exists(expanded):
@@ -98,9 +91,6 @@ def ok_label(tag: str) -> str:
     return "OK"
 
 
-# ----------------------------
-# Mist client (GET only)
-# ----------------------------
 class MistClient:
     def __init__(
         self,
@@ -116,7 +106,7 @@ class MistClient:
         self.timeout = timeout
 
         self.session = requests.Session()
-        self.session.trust_env = False  # deterministic behavior
+        self.session.trust_env = False
 
         self.session.headers.update(
             {
@@ -143,7 +133,6 @@ class MistClient:
             try:
                 resp = self.session.get(url, params=params, timeout=self.timeout)
 
-                # Retry transient errors
                 if resp.status_code in (429, 500, 502, 503, 504):
                     if attempt < self.max_retries:
                         retry_after = resp.headers.get("Retry-After")
@@ -176,9 +165,6 @@ class MistClient:
         raise RuntimeError(f"GET {path} failed unexpectedly")
 
 
-# ----------------------------
-# Excel & CSV Input
-# ----------------------------
 def read_csv_rows(path: str) -> List[Dict[str, str]]:
     """Read CSV file with required columns: site_name, target_version, scope"""
     rows = []
@@ -247,11 +233,7 @@ def read_excel_rows(path: str, sheet_name: Optional[str] = None) -> List[Dict[st
     return out
 
 
-# ----------------------------
-# Site resolution
-# ----------------------------
 def build_site_map(client: MistClient, org_id: str) -> Dict[str, str]:
-    # Single page fetch; assumes <= 1000 sites. Your org ~450.
     sites = client.get(f"/orgs/{org_id}/sites", params={"limit": 1000, "page": 1})
     if not isinstance(sites, list):
         raise RuntimeError("Unexpected response when listing sites (expected a list)")
@@ -263,9 +245,6 @@ def get_site_devices(client: MistClient, site_id: str) -> List[Dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
-# ----------------------------
-# Device helpers
-# ----------------------------
 def device_name(d: Dict[str, Any]) -> str:
     return (d.get("name") or d.get("hostname") or d.get("device_name") or d.get("id") or "unknown").strip()
 
@@ -356,9 +335,6 @@ def evaluate_site(
     return len(eligible), eligible, flagged, counts, ""
 
 
-# ----------------------------
-# Main
-# ----------------------------
 def usage():
     print(
         """
@@ -389,7 +365,7 @@ Example:
 
 def main():
     input_file: Optional[str] = None
-    input_format = "xlsx"  # "xlsx" or "csv"
+    input_format = "xlsx"
     env_path: str = ENV_FILE_DEFAULT
     sheet_name: Optional[str] = None
     tag: str = ""
@@ -424,7 +400,6 @@ def main():
         print("Error: Input file is required (-x/--excel or -c/--csv)")
         usage()
 
-    # Load environment
     try:
         env = load_env_file(env_path)
     except Exception as e:
@@ -446,7 +421,6 @@ def main():
     proxies = {"http": proxy, "https": proxy} if proxy else None
     no_proxy = env.get("NO_PROXY")
 
-    # Initialize Mist client
     client = MistClient(
         base_url=base_url,
         token=token,
@@ -455,7 +429,6 @@ def main():
         max_retries=max_retries,
     )
 
-    # Read input file
     try:
         if input_format == "csv":
             rows = read_csv_rows(input_file)
@@ -465,14 +438,12 @@ def main():
         print(f"ERROR: Failed to read input file: {e}")
         sys.exit(1)
 
-    # Build site map
     try:
         site_map = build_site_map(client, org_id)
     except Exception as e:
         print(f"ERROR: Failed to load sites from Mist: {e}")
         sys.exit(1)
 
-    # Generate report
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag_part = f"_{tag}" if tag else ""
     report_path = f"upgrade_validation{tag_part}_{stamp}.txt"
@@ -516,10 +487,10 @@ def main():
                 continue
 
             if not flagged_devices:
+                # ✅ SHOW ALL ELIGIBLE APs even for OK/BASELINE_OK/SUCCESS
                 lines.append(
                     f"{ok_word} | {site_name} | eligible={eligible_count} | target={target_version} | scope={scope}"
                 )
-                # ✅ FIX #1 & #2: Show ALL eligible APs (full visibility) even when baseline_ok/success
                 for d in eligible_devices:
                     lines.append(
                         f"  - {device_name(d)} [{device_model(d)}] status={device_status(d)} "
@@ -527,6 +498,7 @@ def main():
                     )
                 ok += 1
             else:
+                # SHOW ONLY FLAGGED APs for FLAGGED sites
                 lines.append(
                     f"FLAGGED | {site_name} | eligible={eligible_count} | "
                     f"mismatched={counts['mismatched']} | disconnected={counts['disconnected']} | upgrading={counts['upgrading']}"
@@ -550,7 +522,6 @@ def main():
     lines.append(f"  SKIPPED: {skipped}")
     lines.append(f"  Report file: {report_path}")
 
-    # Write report
     try:
         with open(report_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -559,7 +530,6 @@ def main():
         print(f"ERROR: Failed to write report: {e}")
         sys.exit(1)
 
-    # Print summary to console
     print("\n" + "=" * 80)
     print("SUMMARY")
     print("=" * 80)
@@ -569,8 +539,6 @@ def main():
     print(f"  SKIPPED: {skipped}")
     print("=" * 80)
 
-    # Determine exit code
-    # Fail if any sites flagged, OR all sites skipped (likely config issue)
     if flagged > 0:
         print(f"\n❌ FAILED: {flagged} site(s) flagged")
         sys.exit(1)
