@@ -146,31 +146,34 @@ jobs:
             --tag post \
             --env .env
         continue-on-error: true
-
-      # ✅ FIX #3: Diagnostic step to list all generated files
-      - name: List all generated validation files (DIAGNOSTIC)
+        
+      # ✅ CHANGE: Make the list of files step more verbose
+      - name: List generated files (for debugging)
         if: always()
         run: |
-          echo "=== Searching for validation reports ==="
-          find . -name "upgrade_validation*" -type f 2>/dev/null | sort || echo "No validation files found"
-          echo ""
-          echo "=== Checking specific paths ==="
-          ls -lh upgrade_validation*.txt 2>/dev/null || echo "No upgrade_validation*.txt files in workspace root"
-          echo ""
-          echo "=== Current working directory ==="
-          pwd
-          echo ""
-          echo "=== Files in workspace ==="
-          ls -lh | grep -E "upgrade_validation|script.log" || echo "No upgrade/script files found in root"
-
+            echo "=== FILES IN WORKSPACE ==="
+            ls -la | grep upgrade_validation || echo "No validation files found"
+            echo ""
+            echo "=== ALL REPORTS ==="
+            find . -name "upgrade_validation*.txt" -o -name "script.log" 2>/dev/null | sort
+            echo ""
+            echo "=== ARTIFACT CONTENTS ==="
+            if ls upgrade_validation_*.txt 1> /dev/null 2>&1; then
+              for f in upgrade_validation_*.txt; do
+                echo "--- $f ---"
+                head -20 "$f"
+                echo "..."
+              done
+            fi
+            
       - name: Upload post-validation report
         if: always() && steps.post_validation.outcome != 'skipped'
         uses: actions/upload-artifact@v4
         with:
-          name: post-validation-report
-          path: upgrade_validation_post_*.txt
-          retention-days: 30
-          if-no-files-found: warn
+            name: post-validation-report
+            path: upgrade_validation_post_*.txt
+            retention-days: 30
+            if-no-files-found: warn
 
       - name: Fail if post-validation failed
         if: steps.post_validation.outcome == 'failure'
