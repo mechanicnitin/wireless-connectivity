@@ -1,31 +1,20 @@
 #!/usr/bin/env python3
 """
-Wait for AP stabilization after upgrade trigger (SCOPE-AWARE).
+Wait for AP stabilization - REDESIGNED for parallel checking.
 
-This script polls AP status and waits for:
-1. All eligible APs are connected (per CSV scope)
-2. All eligible APs are on target firmware version
-3. No APs are in upgrade state
+This script works like manual post-validation checking:
+1. Run post-validation for ALL sites at once (not sequentially)
+2. Compare current state to pre-validation baseline
+3. Show summary: ready sites, still upgrading, disconnected, offline_baseline
+4. Only fail if an AP that WAS connected is permanently disconnected
+5. Retry with configurable wait between polls
 
-SCOPE HANDLING:
-- scope="connected": Only connected APs count toward readiness
-- scope="all": All APs count, BUT offline APs matching pre-upgrade 
-              baseline are skipped (informational warnings only)
-
-Baseline Detection:
-- Automatically reads the most recent upgrade_validation_pre_*.txt
-- Extracts which APs were offline before upgrade
-- Prevents false timeouts on known offline spares/backups
-
-Polling strategy:
-- Poll every ~2 minutes (configurable)
-- Max timeout ~30 minutes (configurable)
-- Fail fast if any critical error occurs
-- Return proper exit codes for CI/CD integration
+KEY DIFFERENCE FROM V1:
+- V1: Polls each site sequentially, gets stuck if one is bad
+- V2: Checks ALL sites at once, reports status, retries
 
 Usage:
-  python wait_for_ap_stabilization.py -c site_list.csv --target-version 0.14.xxxx
-  python wait_for_ap_stabilization.py -x site_list.xlsx --target-version 0.14.xxxx
+  python wait_for_ap_stabilization_v2.py -c site_list.csv --target-version 0.14.xxxx
 """
 
 import sys
@@ -34,6 +23,7 @@ import csv
 import getopt
 import time
 import glob
+import re
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -53,6 +43,10 @@ class console:
     @staticmethod
     def error(msg: str):
         print(f"[ERROR] {msg}", file=sys.stderr)
+
+    @staticmethod
+    def success(msg: str):
+        print(f"[SUCCESS] {msg}")
 
 
 def load_env_file(path: str) -> Dict[str, str]:
@@ -84,34 +78,6 @@ def read_csv_rows(path: str) -> List[Dict[str, str]]:
             if site_name:
                 rows.append({"site_name": site_name, "scope": scope})
     return rows
-
-
-def read_excel_rows(path: str, sheet_name: Optional[str] = None) -> List[Dict[str, str]]:
-    wb = load_workbook(filename=path, data_only=True)
-    ws = wb[sheet_name] if sheet_name else wb.worksheets[0]
-    rows = list(ws.iter_rows(values_only=True))
-    
-    if not rows:
-        raise ValueError("Excel sheet is empty")
-
-    headers = [str(h).strip() if h is not None else "" for h in rows[0]]
-    idx = {h.lower(): i for i, h in enumerate(headers) if h}
-
-    if "site_name" not in idx:
-        raise ValueError(f"Missing 'site_name' column. Found: {headers}")
-
-    out = []
-    for r in rows[1:]:
-        if r is None:
-            continue
-        site_name = r[idx["site_name"]]
-        scope = r[idx.get("scope", idx.get("site_name"))] if "scope" in idx else "all"
-        if site_name and str(site_name).strip():
-            out.append({
-                "site_name": str(site_name).strip(),
-                "scope": str(scope).strip().lower() if scope else "all"
-            })
-    return out
 
 
 class MistClient:
@@ -187,26 +153,18 @@ def get_site_devices(client: MistClient, site_id: str) -> List[Dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
-def is_upgrade_in_progress(state: Optional[str]) -> bool:
-    if not state:
-        return False
-    s = str(state).lower()
-    return any(x in s for x in ("download", "upgrading", "install", "reboot"))
-
-
-def parse_baseline_report() -> Dict[str, Set[str]]:
+def parse_baseline_report() -> Dict[str, Dict[str, str]]:
     """
-    Parse the most recent upgrade_validation_pre_*.txt to find which APs were offline.
+    Parse pre-validation report to get baseline AP states.
     
-    Returns:
-      Dict[site_name -> Set[offline_ap_names]]
+    Returns: Dict[site_name -> Dict[ap_name -> "baseline_state"]]
+    Baseline states: "connected_ok", "connected_version_mismatch", "disconnected"
     """
     baseline = {}
     
-    # Find most recent pre-validation report
     reports = sorted(glob.glob("upgrade_validation_pre_*.txt"), reverse=True)
     if not reports:
-        console.warning("No pre-validation baseline report found. Assuming no offline APs.")
+        console.warning("No pre-validation baseline report found.")
         return baseline
     
     report_path = reports[0]
@@ -218,22 +176,29 @@ def parse_baseline_report() -> Dict[str, Set[str]]:
         
         current_site = None
         for line in lines:
-            line = line.strip()
+            line_stripped = line.strip()
             
-            # Match: "BASELINE_OK | Switch_POC | eligible=2 | target=0.14.xxxx | scope=all"
-            if " | " in line and "eligible=" in line:
-                parts = line.split(" | ")
+            # Match site header: "BASELINE_OK | Switch_POC | eligible=1 | target=0.14.xxxx | scope=connected"
+            if " | " in line_stripped and "eligible=" in line_stripped:
+                parts = line_stripped.split(" | ")
                 if len(parts) >= 2:
                     current_site = parts[1].strip()
-                    baseline.setdefault(current_site, set())
+                    baseline.setdefault(current_site, {})
             
-            # Match: "  - DIAtest-AP [AP45] status=disconnected ..."
-            if line.startswith("  - ") and "status=disconnected" in line:
-                if current_site:
-                    # Extract AP name (first token after "- ")
-                    ap_part = line[4:].split(" [")[0].strip()
-                    baseline[current_site].add(ap_part)
-                    console.info(f"  Baseline: {current_site} -> {ap_part} was offline pre-upgrade")
+            # Match AP line: "  - cbnp48ge-01-jap02-45la [AP45] status=connected version=0.14.29967  OK"
+            if line_stripped.startswith("  - ") and current_site:
+                # Extract AP name (first token after "- ")
+                ap_name = line_stripped[4:].split(" [")[0].strip()
+                
+                if "status=disconnected" in line_stripped:
+                    baseline[current_site][ap_name] = "disconnected"
+                elif "status=connected" in line_stripped:
+                    if "OK" in line_stripped or "VERSION_MISMATCH" not in line_stripped:
+                        baseline[current_site][ap_name] = "connected_ok"
+                    else:
+                        baseline[current_site][ap_name] = "connected_version_mismatch"
+        
+        console.info(f"Baseline parsed: {sum(len(v) for v in baseline.values())} APs tracked")
     
     except Exception as e:
         console.warning(f"Failed to parse baseline report: {e}")
@@ -241,121 +206,213 @@ def parse_baseline_report() -> Dict[str, Set[str]]:
     return baseline
 
 
-def evaluate_site_readiness_with_scope(
-    devices: List[Dict[str, Any]],
-    target_version: str,
-    scope: str,
-    allowed_models: List[str],
-    baseline_offline: Set[str],
-) -> Tuple[bool, int, int, int, int, str]:
+def parse_current_validation_report(report_path: str) -> Dict[str, Dict[str, str]]:
     """
-    Evaluate site readiness respecting CSV scope.
+    Parse current validation report to get current AP states.
+    
+    Returns: Dict[site_name -> Dict[ap_name -> "current_state"]]
+    """
+    current = {}
+    
+    try:
+        with open(report_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+        
+        current_site = None
+        for line in lines:
+            line_stripped = line.strip()
+            
+            # Match site header
+            if " | " in line_stripped and "eligible=" in line_stripped:
+                parts = line_stripped.split(" | ")
+                if len(parts) >= 2:
+                    current_site = parts[1].strip()
+                    current.setdefault(current_site, {})
+            
+            # Match AP line
+            if line_stripped.startswith("  - ") and current_site:
+                ap_name = line_stripped[4:].split(" [")[0].strip()
+                
+                if "status=disconnected" in line_stripped:
+                    current[current_site][ap_name] = "disconnected"
+                elif "status=connected" in line_stripped:
+                    if "OK" in line_stripped or "VERSION_MISMATCH" not in line_stripped:
+                        current[current_site][ap_name] = "connected_ok"
+                    else:
+                        current[current_site][ap_name] = "connected_version_mismatch"
+                elif "UPGRADE_IN_PROGRESS" in line_stripped:
+                    current[current_site][ap_name] = "upgrading"
+    
+    except Exception as e:
+        console.warning(f"Failed to parse current report: {e}")
+    
+    return current
+
+
+def compare_baseline_to_current(
+    baseline: Dict[str, Dict[str, str]],
+    current: Dict[str, Dict[str, str]],
+) -> Dict[str, Any]:
+    """
+    Compare baseline to current state and return status summary.
     
     Returns:
-      (is_ready, connected, correct_version, upgrading, offline_baseline, issue_summary)
-    
-    Scope behavior:
-      connected: Only connected APs count toward readiness
-      all: All APs count, but offline APs matching baseline are skipped
+    {
+      "all_ready": bool,
+      "sites": {
+        site_name: {
+          "status": "READY" | "UPGRADING" | "DISCONNECTED",
+          "connected": int,
+          "upgrading": int,
+          "disconnected": int,
+          "issues": [list of problems]
+        }
+      }
+    }
     """
-    ap_models = {m.strip().upper() for m in allowed_models}
+    summary = {
+        "all_ready": True,
+        "sites": {}
+    }
     
-    # Filter to allowed models
-    eligible_aps = [d for d in devices if (d.get("model") or "").strip().upper() in ap_models]
-    
-    if not eligible_aps:
-        return False, 0, 0, 0, 0, "No eligible APs found"
-
-    connected = 0
-    correct_version = 0
-    upgrading = 0
-    offline_baseline = 0
-    issues = []
-
-    for ap in eligible_aps:
-        ap_name = (ap.get("name") or ap.get("id") or "unknown").strip()
-        is_connected = (ap.get("status") or "").strip().lower() == "connected"
-        version = (ap.get("version") or ap.get("firmware_version") or "UNKNOWN").strip()
-        upgrade_state = ap.get("firmware_status") or ap.get("upgrade_status") or None
-        is_upgrading = is_upgrade_in_progress(upgrade_state)
-
-        # Check if this AP was offline in baseline
-        is_baseline_offline = ap_name in baseline_offline
-
-        if scope == "connected":
-            # strict: only connected APs count
-            if is_connected:
-                connected += 1
-            else:
-                issues.append(f"{ap_name}: disconnected (scope=connected requires online)")
-            
-            if version == target_version:
-                correct_version += 1
-            else:
-                issues.append(f"{ap_name}: version {version} (expected {target_version})")
-            
-            if is_upgrading:
-                upgrading += 1
-                issues.append(f"{ap_name}: upgrading ({upgrade_state})")
+    # Check each site in baseline
+    for site_name, baseline_aps in baseline.items():
+        if not baseline_aps:
+            continue
         
-        else:  # scope == "all"
-            # flexible: all APs count, but skip baseline-offline
-            if is_baseline_offline:
-                offline_baseline += 1
-                issues.append(f"{ap_name}: offline (baseline match - expected offline)")
-            elif is_connected:
-                connected += 1
-            else:
-                issues.append(f"{ap_name}: disconnected (unexpected - was online pre-upgrade)")
+        current_aps = current.get(site_name, {})
+        
+        connected = 0
+        upgrading = 0
+        disconnected = 0
+        issues = []
+        
+        # For each AP that was in baseline
+        for ap_name, baseline_state in baseline_aps.items():
+            current_state = current_aps.get(ap_name, "unknown")
             
-            if version == target_version:
-                correct_version += 1
-            else:
-                issues.append(f"{ap_name}: version {version} (expected {target_version})")
+            if baseline_state == "disconnected":
+                # This AP was offline pre-upgrade, skip it
+                continue
             
-            if is_upgrading:
-                upgrading += 1
-                issues.append(f"{ap_name}: upgrading ({upgrade_state})")
-
-    total = len(eligible_aps)
+            # This AP WAS connected before upgrade
+            if baseline_state in ("connected_ok", "connected_version_mismatch"):
+                if current_state == "connected_ok":
+                    connected += 1
+                elif current_state == "upgrading":
+                    upgrading += 1
+                    issues.append(f"{ap_name}: still upgrading")
+                elif current_state == "connected_version_mismatch":
+                    issues.append(f"{ap_name}: version mismatch")
+                elif current_state == "disconnected":
+                    disconnected += 1
+                    issues.append(f"{ap_name}: DISCONNECTED (was connected pre-upgrade!)")
+                else:
+                    issues.append(f"{ap_name}: unknown state")
+        
+        total = len([b for b in baseline_aps.values() if b != "disconnected"])
+        
+        if total == 0:
+            status = "SKIPPED"
+        elif disconnected > 0:
+            status = "DISCONNECTED"
+            summary["all_ready"] = False
+        elif upgrading > 0:
+            status = "UPGRADING"
+            summary["all_ready"] = False
+        elif connected == total:
+            status = "READY"
+        else:
+            status = "UNKNOWN"
+            summary["all_ready"] = False
+        
+        summary["sites"][site_name] = {
+            "status": status,
+            "connected": connected,
+            "upgrading": upgrading,
+            "disconnected": disconnected,
+            "total": total,
+            "issues": issues[:3]  # Limit to 3 issues
+        }
     
-    # Readiness depends on scope
-    if scope == "connected":
-        is_ready = (connected == total) and (correct_version == total) and (upgrading == 0)
-    else:  # all
-        # Ready if: (connected + baseline_offline == total) AND (correct_version == total) AND (upgrading == 0)
-        non_baseline = total - offline_baseline
-        is_ready = (connected == non_baseline) and (correct_version == total) and (upgrading == 0)
-    
-    issue_summary = "; ".join(issues[:5])
-    if len(issues) > 5:
-        issue_summary += f"; +{len(issues)-5} more"
+    return summary
 
-    return is_ready, connected, correct_version, upgrading, offline_baseline, issue_summary
+
+def run_validation(client: MistClient, org_id: str, site_names_with_scope: Dict[str, str], 
+                  target_version: str, allowed_models: List[str]) -> str:
+    """
+    Run validate_ap_status.py and return report path.
+    """
+    import subprocess
+    
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    report_path = f"upgrade_validation_post_{stamp}.txt"
+    
+    # Create temp CSV for validation
+    csv_path = f"temp_sites_{stamp}.csv"
+    try:
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("site_name,target_version,scope\n")
+            for site_name, scope in site_names_with_scope.items():
+                f.write(f"{site_name},{target_version},{scope}\n")
+        
+        # Run validation script
+        result = subprocess.run(
+            [
+                sys.executable,
+                "Dev/AP upgrade/validate_ap_status.py",
+                "-c", csv_path,
+                "--tag", "post",
+                "--env", ".env"
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 min timeout
+        )
+        
+        # Move report to expected location
+        # The script creates upgrade_validation_post_<stamp>.txt
+        import glob as glob_module
+        reports = sorted(glob_module.glob("upgrade_validation_post_*.txt"), reverse=True)
+        if reports:
+            report_path = reports[0]
+        
+        return report_path
+    
+    except Exception as e:
+        console.error(f"Failed to run validation: {e}")
+        raise
+    finally:
+        # Clean up temp CSV
+        if os.path.exists(csv_path):
+            os.remove(csv_path)
 
 
 def usage():
     print(
         """
-Wait for AP Stabilization After Upgrade (SCOPE-AWARE)
+Wait for AP Stabilization - V2 (Parallel Checking)
 
 Required:
-  -x, --excel=        Excel file (.xlsx) with site_name, [scope] columns
-  -c, --csv=          CSV file (.csv) with site_name, [scope] columns
+  -c, --csv=          CSV file (.csv) with site_name, scope columns
   --target-version=   Target firmware version (e.g., 0.14.xxxx)
 
 Optional:
   -e, --env=          Env file path (default: ./.env)
-  --poll-interval=    Seconds between polls (default: 120)
+  --poll-interval=    Seconds between polls (default: 120 = 2 min)
   --max-wait=         Maximum seconds to wait (default: 1800 = 30 min)
 
-Scope behavior:
-  connected - Only online APs must reach target (strict)
-  all       - All APs count, offline baseline APs are skipped (flexible)
+HOW IT WORKS:
+1. Reads pre-validation baseline report
+2. Runs post-validation for ALL sites at once
+3. Compares current state to baseline
+4. Reports: ready sites, upgrading, disconnected, offline_baseline
+5. Only fails if AP that WAS connected is now disconnected
+6. Retries with configurable wait
 
 Example:
-  python wait_for_ap_stabilization.py -c site_list.csv --target-version 0.14.xxxx
-  python wait_for_ap_stabilization.py -x site_list.xlsx --target-version 0.14.xxxx --max-wait 1800
+  python wait_for_ap_stabilization_v2.py -c site_list.csv --target-version 0.14.xxxx
+  python wait_for_ap_stabilization_v2.py -c site_list.csv --target-version 0.14.xxxx --poll-interval 120 --max-wait 1800
 """
     )
     sys.exit(1)
@@ -363,18 +420,16 @@ Example:
 
 if __name__ == "__main__":
     input_file: Optional[str] = None
-    input_format = "xlsx"
     env_file = ".env"
     target_version: Optional[str] = None
-    sheet_name: Optional[str] = None
-    poll_interval = 120
-    max_wait = 1800
+    poll_interval = 120  # 2 minutes
+    max_wait = 1800  # 30 minutes
 
     try:
         opts, _ = getopt.getopt(
             sys.argv[1:],
-            "hx:c:e:",
-            ["help", "excel=", "csv=", "env=", "sheet=", "target-version=", "poll-interval=", "max-wait="],
+            "hc:e:",
+            ["help", "csv=", "env=", "target-version=", "poll-interval=", "max-wait="],
         )
     except getopt.GetoptError as err:
         console.error(str(err))
@@ -383,16 +438,10 @@ if __name__ == "__main__":
     for o, a in opts:
         if o in ("-h", "--help"):
             usage()
-        elif o in ("-x", "--excel"):
-            input_file = a
-            input_format = "xlsx"
         elif o in ("-c", "--csv"):
             input_file = a
-            input_format = "csv"
         elif o in ("-e", "--env"):
             env_file = a
-        elif o == "--sheet":
-            sheet_name = a
         elif o == "--target-version":
             target_version = a
         elif o == "--poll-interval":
@@ -409,7 +458,7 @@ if __name__ == "__main__":
                 sys.exit(1)
 
     if not input_file or not target_version:
-        console.error("Both input file and --target-version are required")
+        console.error("Both CSV file and --target-version are required")
         usage()
 
     # Load environment
@@ -429,16 +478,16 @@ if __name__ == "__main__":
 
     # Read input file
     try:
-        if input_format == "csv":
-            rows = read_csv_rows(input_file)
-        else:
-            rows = read_excel_rows(input_file, sheet_name)
+        rows = read_csv_rows(input_file)
     except Exception as e:
         console.error(f"Failed to read input file: {e}")
         sys.exit(1)
 
     site_names_with_scope = {r["site_name"]: r.get("scope", "all") for r in rows}
     console.info(f"Loaded {len(site_names_with_scope)} site(s) from {input_file}")
+
+    allowed_models = [(env.get("ALLOWED_MODELS") or "AP45").strip()]
+    allowed_models = [m.strip() for m in allowed_models[0].split(",") if m.strip()]
 
     # Setup Mist client
     proxy = env.get("ALL_PROXY") or env.get("HTTPS_PROXY") or env.get("HTTP_PROXY")
@@ -452,92 +501,72 @@ if __name__ == "__main__":
         no_proxy=no_proxy,
     )
 
-    # Build site map
-    try:
-        site_map = build_site_map(client, org_id)
-    except Exception as e:
-        console.error(f"Failed to load sites: {e}")
+    # Parse baseline
+    baseline = parse_baseline_report()
+    if not baseline:
+        console.error("No baseline data found. Run pre-validation first!")
         sys.exit(1)
 
-    # Resolve site IDs
-    site_ids: Dict[str, Tuple[str, str]] = {}  # name -> (id, scope)
-    for name, scope in site_names_with_scope.items():
-        site_id = site_map.get(name.lower())
-        if not site_id:
-            console.warning(f"Site not found: {name}")
-        else:
-            site_ids[name] = (site_id, scope)
-
-    if not site_ids:
-        console.error("No valid sites found")
-        sys.exit(1)
-
-    allowed_models = [(env.get("ALLOWED_MODELS") or "AP45").strip()]
-    allowed_models = [m.strip() for m in allowed_models[0].split(",") if m.strip()]
-
-    # Parse baseline (which APs were offline pre-upgrade)
-    baseline_offline_per_site = parse_baseline_report()
+    console.info(f"Baseline: {sum(len(v) for v in baseline.values())} APs from pre-validation")
 
     # Polling loop
-    console.info(f"Starting stabilization poll (interval={poll_interval}s, max_wait={max_wait}s)")
+    console.info(f"Starting stabilization checks (interval={poll_interval}s, max_wait={max_wait}s)")
     console.info(f"Target version: {target_version}")
-    console.info(f"Watching {len(site_ids)} site(s)")
 
     start_time = time.time()
     poll_count = 0
-    all_ready = False
 
     while time.time() - start_time < max_wait:
         poll_count += 1
         elapsed = int(time.time() - start_time)
         console.info(f"\n--- Poll #{poll_count} (elapsed: {elapsed}s) ---")
 
-        all_ready = True
-        failed_sites = []
+        try:
+            # Run validation for ALL sites at once
+            report_path = run_validation(client, org_id, site_names_with_scope, target_version, allowed_models)
+            console.info(f"Post-validation report: {report_path}")
 
-        for site_name, (site_id, scope) in site_ids.items():
-            try:
-                devices = get_site_devices(client, site_id)
-                baseline_offline = baseline_offline_per_site.get(site_name, set())
-                
-                is_ready, connected, correct_version, upgrading, offline_baseline, issue_summary = evaluate_site_readiness_with_scope(
-                    devices, target_version, scope, allowed_models, baseline_offline
-                )
+            # Parse and compare
+            current = parse_current_validation_report(report_path)
+            summary = compare_baseline_to_current(baseline, current)
 
-                total_aps = len([d for d in devices if (d.get("model") or "").strip().upper() in {m.upper() for m in allowed_models}])
+            # Print summary
+            ready_count = sum(1 for s in summary["sites"].values() if s["status"] == "READY")
+            upgrading_count = sum(1 for s in summary["sites"].values() if s["status"] == "UPGRADING")
+            disconnected_count = sum(1 for s in summary["sites"].values() if s["status"] == "DISCONNECTED")
+            
+            console.info(f"Status: {ready_count} READY, {upgrading_count} UPGRADING, {disconnected_count} DISCONNECTED")
 
-                if is_ready:
-                    console.info(f"✓ {site_name}: READY (scope={scope}, {connected}/{total_aps} online, all v{target_version}, 0 upgrading)")
-                else:
-                    all_ready = False
+            # Print problem sites
+            for site_name, site_status in summary["sites"].items():
+                if site_status["status"] != "READY":
                     console.warning(
-                        f"✗ {site_name}: NOT READY (scope={scope}, {connected}/{total_aps} online, "
-                        f"{correct_version}/{total_aps} on target, {upgrading} upgrading, {offline_baseline} baseline)"
+                        f"  {site_name}: {site_status['status']} "
+                        f"({site_status['connected']}/{site_status['total']} ok, "
+                        f"{site_status['upgrading']} upgrading, "
+                        f"{site_status['disconnected']} disconnected)"
                     )
-                    if issue_summary:
-                        console.warning(f"  Issues: {issue_summary}")
+                    for issue in site_status["issues"]:
+                        console.warning(f"    - {issue}")
 
-            except Exception as e:
-                all_ready = False
-                console.error(f"✗ {site_name}: ERROR - {e}")
-                failed_sites.append(site_name)
+            if summary["all_ready"]:
+                console.success("\n✓✓✓ All sites stabilized! ✓✓✓")
+                sys.exit(0)
 
-        if all_ready:
-            console.info("\n✓✓✓ All sites stabilized! ✓✓✓")
-            sys.exit(0)
-
-        if failed_sites:
-            console.error(f"\nSites with API errors: {', '.join(failed_sites)}")
-            console.error("Continuing polls despite errors...")
+        except Exception as e:
+            console.error(f"Error during validation: {e}")
+            console.error("Continuing to next poll...")
 
         remaining = max_wait - (time.time() - start_time)
         if remaining > poll_interval:
-            console.info(f"Waiting {poll_interval}s before next poll ({int(remaining)}s remaining)...")
+            console.info(f"Waiting {poll_interval}s before next check ({int(remaining)}s remaining)...")
             time.sleep(poll_interval)
         else:
             break
 
     # Timeout reached
     console.error(f"\n✗✗✗ Timeout reached after {elapsed}s ✗✗✗")
-    console.error("Not all APs have stabilized. Check logs and Mist dashboard for details.")
+    console.error("Not all APs have stabilized within the timeout period.")
+    console.error("Run post-validation manually to see current status:")
+    console.error(f"  python Dev/AP upgrade/validate_ap_status.py -c {input_file} --tag post --env .env")
     sys.exit(1)
