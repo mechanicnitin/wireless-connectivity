@@ -1,23 +1,24 @@
 #!/usr/bin/env python3
 """
-Wait for AP stabilization - REDESIGNED for parallel checking with VERSION validation.
+Wait for AP stabilization - VERSION-AWARE (Parallel Checking with API Delay Handling).
 
 This script works like manual post-validation checking:
 1. Run post-validation for ALL sites at once
 2. Compare current state to pre-validation baseline
-3. VALIDATE VERSIONS - only pass if version matches target
+3. VALIDATE VERSIONS - parse target vs current version
 4. Show summary: ready sites, still upgrading, disconnected, version mismatches
 5. Only fail if an AP that WAS connected is permanently disconnected
 6. Retry with configurable wait between polls
 
 KEY DIFFERENCES:
-- Validates VERSION (not just connection)
+- Validates VERSION (parses target vs current)
+- Handles API delay (versions take time to register on Mist)
+- Only marks "READY" when: connected AND current_version == target_version AND not upgrading
 - Parses BOTH BASELINE_OK and FLAGGED baseline reports
-- Handles API delay (versions take time to register)
-- Only marks "READY" when version == target AND connected
+- Uses version=(target) (current=actual) format
 
 Usage:
-  python wait_for_ap_stabilization.py -c site_list.csv --target-version 0.14.29543
+  python wait_for_ap_stabilization.py -c site_list.csv --target-version 0.14.29967
 """
 
 import sys
@@ -89,8 +90,9 @@ def parse_baseline_report() -> Dict[str, Dict[str, Dict[str, str]]]:
     Parse pre-validation report to get baseline AP states.
     
     Handles BOTH BASELINE_OK and FLAGGED lines.
+    Parses NEW format: version=<target> (current=<actual>)
     
-    Returns: Dict[site_name -> Dict[ap_name -> {"status": "...", "version": "..."}]]
+    Returns: Dict[site_name -> Dict[ap_name -> {"status": "...", "target_version": "...", "current_version": "..."}]]
     """
     baseline = {}
     
@@ -118,7 +120,7 @@ def parse_baseline_report() -> Dict[str, Dict[str, Dict[str, str]]]:
                     baseline.setdefault(current_site, {})
                     console.info(f"  Baseline site: {current_site}")
             
-            # Match AP line: "  - cbnp48ge-01-jap02-45la [AP45] status=connected version=0.14.29967  OK"
+            # Match AP line: "  - cbnp48ge-01-jap02-45la [AP45] status=connected version=0.14.29967 (current=0.14.29543)  OK"
             if line_stripped.startswith("  - ") and current_site:
                 # Extract AP name
                 ap_name = line_stripped[4:].split(" [")[0].strip()
@@ -130,15 +132,24 @@ def parse_baseline_report() -> Dict[str, Dict[str, Dict[str, str]]]:
                 elif "status=connected" in line_stripped:
                     status = "connected"
                 
-                # Extract version
-                version_match = re.search(r'version=(\S+)', line_stripped)
-                version = version_match.group(1) if version_match else "UNKNOWN"
+                # Extract target version and current version
+                # Format: version=<target> (current=<actual>)
+                version_match = re.search(r'version=(\S+)\s+\(current=(\S+)\)', line_stripped)
+                if version_match:
+                    target_ver = version_match.group(1)
+                    current_ver = version_match.group(2)
+                else:
+                    # Fallback for old format
+                    version_match = re.search(r'version=(\S+)', line_stripped)
+                    target_ver = version_match.group(1) if version_match else "UNKNOWN"
+                    current_ver = "UNKNOWN"
                 
                 baseline[current_site][ap_name] = {
                     "status": status,
-                    "version": version
+                    "target_version": target_ver,
+                    "current_version": current_ver
                 }
-                console.info(f"    AP: {ap_name} -> status={status}, version={version}")
+                console.info(f"    AP: {ap_name} -> status={status}, target={target_ver}, current={current_ver}")
         
         total_aps = sum(len(v) for v in baseline.values())
         console.info(f"Baseline parsed: {total_aps} APs tracked across {len(baseline)} sites")
@@ -153,7 +164,9 @@ def parse_current_validation_report(report_path: str) -> Dict[str, Dict[str, Dic
     """
     Parse current validation report to get current AP states.
     
-    Returns: Dict[site_name -> Dict[ap_name -> {"status": "...", "version": "...", "issues": [...]}]]
+    Parses NEW format: version=<target> (current=<actual>)
+    
+    Returns: Dict[site_name -> Dict[ap_name -> {"status": "...", "target_version": "...", "current_version": "...", "issues": [...]}]]
     """
     current = {}
     
@@ -183,9 +196,16 @@ def parse_current_validation_report(report_path: str) -> Dict[str, Dict[str, Dic
                 elif "status=connected" in line_stripped:
                     status = "connected"
                 
-                # Extract version
-                version_match = re.search(r'version=(\S+)', line_stripped)
-                version = version_match.group(1) if version_match else "UNKNOWN"
+                # Extract target version and current version
+                version_match = re.search(r'version=(\S+)\s+\(current=(\S+)\)', line_stripped)
+                if version_match:
+                    target_ver = version_match.group(1)
+                    current_ver = version_match.group(2)
+                else:
+                    # Fallback for old format
+                    version_match = re.search(r'version=(\S+)', line_stripped)
+                    target_ver = version_match.group(1) if version_match else "UNKNOWN"
+                    current_ver = "UNKNOWN"
                 
                 # Extract issues
                 issues = []
@@ -198,7 +218,8 @@ def parse_current_validation_report(report_path: str) -> Dict[str, Dict[str, Dic
                 
                 current[current_site][ap_name] = {
                     "status": status,
-                    "version": version,
+                    "target_version": target_ver,
+                    "current_version": current_ver,
                     "issues": issues
                 }
     
@@ -217,9 +238,9 @@ def compare_baseline_to_current(
     Compare baseline to current state and return status summary.
     
     KEY LOGIC:
-    - AP must be CONNECTED (or was disconnected pre-upgrade)
-    - AP must be at TARGET_VERSION
-    - Only then it's READY
+    - AP must be CONNECTED (or was disconnected pre-upgrade, then skip)
+    - AP's CURRENT version must match TARGET_VERSION
+    - AP must NOT be upgrading
     
     Returns:
     {
@@ -259,11 +280,13 @@ def compare_baseline_to_current(
         # For each AP that was in baseline
         for ap_name, baseline_state in baseline_aps.items():
             baseline_status = baseline_state["status"]
-            baseline_version = baseline_state["version"]
+            baseline_target = baseline_state["target_version"]
+            baseline_current = baseline_state["current_version"]
             
             current_state = current_aps.get(ap_name, {})
             current_status = current_state.get("status", "unknown")
-            current_version = current_state.get("version", "UNKNOWN")
+            current_target = current_state.get("target_version", "UNKNOWN")
+            current_current = current_state.get("current_version", "UNKNOWN")
             current_issues = current_state.get("issues", [])
             
             # Skip APs that were disconnected pre-upgrade
@@ -282,13 +305,15 @@ def compare_baseline_to_current(
                     connected += 1
                 else:
                     issues.append(f"{ap_name}: unknown status {current_status}")
+                    summary["all_ready"] = False
                 
-                # Check 2: Is it at target version?
-                if current_version == target_version:
+                # Check 2: Is current version == target version?
+                # (target_version is what we're upgrading TO)
+                if current_current == target_version:
                     correct_version += 1
                 else:
                     version_mismatch += 1
-                    issues.append(f"{ap_name}: version {current_version} (target: {target_version})")
+                    issues.append(f"{ap_name}: version {current_current} (target: {target_version})")
                     summary["all_ready"] = False
                 
                 # Check 3: Is it upgrading?
@@ -374,11 +399,11 @@ def run_validation(site_names_with_scope: Dict[str, str], target_version: str) -
 def usage():
     print(
         """
-Wait for AP Stabilization - VERSION-AWARE (Parallel Checking)
+Wait for AP Stabilization - VERSION-AWARE (Parallel Checking with API Delay Handling)
 
 Required:
   -c, --csv=          CSV file (.csv) with site_name, scope columns
-  --target-version=   Target firmware version (e.g., 0.14.29543)
+  --target-version=   Target firmware version (e.g., 0.14.29967)
 
 Optional:
   -e, --env=          Env file path (default: ./.env)
@@ -387,20 +412,21 @@ Optional:
 
 VALIDATION CRITERIA (ALL must pass):
 1. AP must be CONNECTED (or was disconnected pre-upgrade)
-2. AP must be at TARGET_VERSION
+2. AP's CURRENT version must == TARGET_VERSION
 3. AP must NOT be upgrading
 
 HOW IT WORKS:
-1. Reads pre-validation baseline report (connects to Mist, gets current state)
+1. Reads pre-validation baseline report
 2. Runs post-validation for ALL sites at once (parallel)
 3. Compares current state to baseline
-4. VALIDATES VERSION (not just connection!)
+4. Parses version=<target> (current=<actual>) format
 5. Reports: ready sites, upgrading, disconnected, version mismatches
 6. Only fails if AP that WAS connected is now disconnected
-7. Retries with configurable wait
+7. Retries with configurable wait (2 min default) to handle API delays
 
 Example:
-  python wait_for_ap_stabilization.py -c site_list.csv --target-version 0.14.29543
+  python wait_for_ap_stabilization.py -c site_list.csv --target-version 0.14.29967
+  python wait_for_ap_stabilization.py -c site_list.csv --target-version 0.14.29967 --poll-interval 120 --max-wait 1800
 """
     )
     sys.exit(1)
@@ -410,8 +436,8 @@ if __name__ == "__main__":
     input_file: Optional[str] = None
     env_file = ".env"
     target_version: Optional[str] = None
-    poll_interval = 120
-    max_wait = 1800
+    poll_interval = 120  # 2 minutes
+    max_wait = 1800  # 30 minutes
 
     try:
         opts, _ = getopt.getopt(
@@ -478,7 +504,7 @@ if __name__ == "__main__":
     # Polling loop
     console.info(f"Starting stabilization checks (interval={poll_interval}s, max_wait={max_wait}s)")
     console.info(f"Target version: {target_version}")
-    console.info(f"Validation: connected + version match + not upgrading\n")
+    console.info(f"Validation: connected + current_version == target_version + not upgrading\n")
 
     start_time = time.time()
     poll_count = 0
