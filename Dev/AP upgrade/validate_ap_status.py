@@ -2,6 +2,11 @@
 """
 Validate AP firmware status per site (pre/post-check), driven by Excel/CSV.
 
+KEY FIX: Show ALL eligible APs for FLAGGED sites too!
+- FLAGGED sites now display: summary line + ALL eligible APs (with issues highlighted)
+- OK/BASELINE_OK/SUCCESS sites display: summary line + ALL eligible APs
+- This provides full baseline visibility for comparison with post-validation
+
 Inputs:
 - Excel/CSV columns required: site_name, target_version, scope
 - .env required:
@@ -10,9 +15,10 @@ Inputs:
     MIST_ACCESS_TOKEN
 
 Reporting rules:
-  OK/BASELINE_OK/SUCCESS sites: Show ALL eligible APs (full visibility)
-    - Used for baseline comparison with post-validation
-  FLAGGED sites: Show only problematic APs (issues only)
+  OK/BASELINE_OK/SUCCESS sites: Show ALL eligible APs
+    - Each AP line shows: name [model] status=X version=Y  OK (or issues)
+  FLAGGED sites: Show ALL eligible APs with issues highlighted
+    - Each AP line shows: name [model] status=X version=Y  [ISSUES if any]
   SKIPPED sites: Single line with reason
 
 Tagging:
@@ -289,14 +295,14 @@ def evaluate_site(
     """
     Returns:
       eligible_count,
-      eligible_devices (all eligible, for full visibility),
-      flagged_devices (device, issues),
+      eligible_devices (ALL eligible devices),
+      flagged_devices (devices with issues),
       counts dict,
       skipped_reason ("" if not skipped)
     """
     eligible: List[Dict[str, Any]] = []
 
-    # Filter eligible
+    # Filter eligible devices based on scope
     for d in devices:
         model = device_model(d)
         if model not in allowed_models:
@@ -487,7 +493,7 @@ def main():
                 continue
 
             if not flagged_devices:
-                # ✅ SHOW ALL ELIGIBLE APs even for OK/BASELINE_OK/SUCCESS
+                # ✅ OK CASE: Show all eligible APs
                 lines.append(
                     f"{ok_word} | {site_name} | eligible={eligible_count} | target={target_version} | scope={scope}"
                 )
@@ -498,16 +504,37 @@ def main():
                     )
                 ok += 1
             else:
-                # SHOW ONLY FLAGGED APs for FLAGGED sites
+                # ✅ FLAGGED CASE: Show ALL eligible APs (with issues highlighted)
                 lines.append(
                     f"FLAGGED | {site_name} | eligible={eligible_count} | "
                     f"mismatched={counts['mismatched']} | disconnected={counts['disconnected']} | upgrading={counts['upgrading']}"
                 )
-                for d, issues in flagged_devices:
-                    lines.append(
-                        f"  - {device_name(d)} [{device_model(d)}] status={device_status(d)} "
-                        f"version={device_version(d)}  {'; '.join(issues)}"
-                    )
+                
+                # ✅ FIX: Show ALL eligible APs, not just flagged ones
+                flagged_set = {device_name(d) for d, _ in flagged_devices}
+                for d in eligible_devices:
+                    ap_name = device_name(d)
+                    
+                    # Find issues for this AP
+                    issues = []
+                    for fd, fi in flagged_devices:
+                        if device_name(fd) == ap_name:
+                            issues = fi
+                            break
+                    
+                    if issues:
+                        # AP has issues
+                        lines.append(
+                            f"  - {ap_name} [{device_model(d)}] status={device_status(d)} "
+                            f"version={device_version(d)}  {'; '.join(issues)}"
+                        )
+                    else:
+                        # AP is OK (even though site is flagged)
+                        lines.append(
+                            f"  - {ap_name} [{device_model(d)}] status={device_status(d)} "
+                            f"version={device_version(d)}  OK"
+                        )
+                
                 flagged += 1
 
         except Exception as e:
