@@ -24,9 +24,6 @@ import subprocess
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
-import requests
-from openpyxl import load_workbook
-
 
 class console:
     @staticmethod
@@ -82,7 +79,7 @@ def parse_baseline_report() -> Dict[str, Dict[str, str]]:
     Parse pre-validation report to get baseline AP states.
     
     Returns: Dict[site_name -> Dict[ap_name -> "version"]]
-    Only tracks CONNECTED APs (eligible ones)
+    Only tracks CONNECTED APs (eligible ones with OK status)
     """
     baseline = {}
     
@@ -102,7 +99,7 @@ def parse_baseline_report() -> Dict[str, Dict[str, str]]:
         for line in lines:
             line_stripped = line.strip()
             
-            # Match site header: "BASELINE_OK | Switch_POC | ..."
+            # Match site header with eligible APs: "BASELINE_OK | Switch_POC | eligible=..."
             if " | " in line_stripped and "eligible=" in line_stripped:
                 parts = line_stripped.split(" | ")
                 if len(parts) >= 2:
@@ -110,7 +107,7 @@ def parse_baseline_report() -> Dict[str, Dict[str, str]]:
                     baseline.setdefault(current_site, {})
                     console.info(f"  Baseline site: {current_site}")
             
-            # Match eligible AP line: "  - cbnp48ge-01-jap02-45la [AP45] status=connected version=0.14.29543  OK"
+            # Match eligible AP line with OK status: "  - cbnp48ge-01-jap02-45la [AP45] status=connected version=0.14.29543  OK"
             if line_stripped.startswith("  - ") and current_site and "OK" in line_stripped:
                 ap_name = line_stripped[4:].split(" [")[0].strip()
                 
