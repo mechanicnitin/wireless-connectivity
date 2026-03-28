@@ -16,6 +16,12 @@ Inputs:
   scope values:
     all | connected
 
+SCOPE BEHAVIOR:
+- scope="connected": Only upgrades connected APs
+- scope="all": Upgrades all connected APs (offline APs can't be upgraded anyway)
+
+Note: Mist API only allows upgrading connected APs, so scope is mainly informational.
+
 Usage:
   python bulk_ap_upgrade.py -x site_list.xlsx --dry_run --preflight
   python bulk_ap_upgrade.py -x site_list.xlsx --yes
@@ -41,7 +47,7 @@ SHEET_NAME: Optional[str] = None
 DRY_RUN = False
 DO_PREFLIGHT = False
 AUTO_YES = False
-INPUT_FORMAT = "xlsx"  # "xlsx" or "csv"
+INPUT_FORMAT = "xlsx"
 
 LOGGER = logging.getLogger(__name__)
 
@@ -349,11 +355,18 @@ def select_target_ap_device_ids(
     scope: str,
     allowed_models: List[str],
 ) -> List[str]:
+    """
+    Select APs to upgrade based on scope.
+    
+    Note: Mist API can only upgrade CONNECTED APs anyway.
+    Scope determines what we attempt, but only connected APs will actually upgrade.
+    """
     out: List[str] = []
     for d in devices:
         if not is_allowed_model(d, allowed_models):
             continue
-        if scope == "connected" and not is_connected(d):
+        # Always check connected - Mist can't upgrade disconnected APs
+        if not is_connected(d):
             continue
         did = get_device_id(d)
         if did:
@@ -531,7 +544,6 @@ if __name__ == "__main__":
             console.critical("Check proxy reachability, credentials, and whether proxy requires auth.")
             sys.exit(1)
 
-    # Read input file
     try:
         if INPUT_FORMAT == "csv":
             rows = read_csv_rows(INPUT_FILE)
@@ -545,7 +557,6 @@ if __name__ == "__main__":
         console.critical("No usable rows found in input file.")
         sys.exit(1)
 
-    # Build site lookup
     try:
         site_map = build_site_name_to_id(client, org_id)
     except Exception as e:
@@ -656,7 +667,6 @@ if __name__ == "__main__":
 
     console.info(f"\nDone. Success={success}, Skipped={skipped}, Failed={failed}. Log: {LOG_FILE}")
     
-    # Exit with proper exit code
     if failed > 0:
         sys.exit(1)
     sys.exit(0)
