@@ -2,11 +2,6 @@
 """
 Validate AP firmware status per site (pre/post-check), driven by Excel/CSV.
 
-KEY FIX: Show ALL eligible APs for FLAGGED sites too!
-- FLAGGED sites now display: summary line + ALL eligible APs (with issues highlighted)
-- OK/BASELINE_OK/SUCCESS sites display: summary line + ALL eligible APs
-- This provides full baseline visibility for comparison with post-validation
-
 Inputs:
 - Excel/CSV columns required: site_name, target_version, scope
 - .env required:
@@ -14,12 +9,14 @@ Inputs:
     MIST_ORG_ID
     MIST_ACCESS_TOKEN
 
-Reporting rules:
-  OK/BASELINE_OK/SUCCESS sites: Show ALL eligible APs
-    - Each AP line shows: name [model] status=X version=Y  OK (or issues)
-  FLAGGED sites: Show ALL eligible APs with issues highlighted
-    - Each AP line shows: name [model] status=X version=Y  [ISSUES if any]
-  SKIPPED sites: Single line with reason
+Reporting rules (as requested):
+  OK | <site> | eligible=<n> | target=<ver> | scope=<scope>
+    - <ap> [<model>] status=<status> version=<target> (current=<current>)  OK
+- FLAGGED sites: summary line + only problematic APs
+  FLAGGED | <site> | eligible=<n> | mismatched=<n> | disconnected=<n> | upgrading=<n>
+    - <ap> [<model>] status=<status> version=<target> (current=<current>)  <issue1>; <issue2>
+- SKIPPED sites: single line with reason
+  SKIPPED | <site> | reason=<reason>
 
 Tagging:
 - --tag pre  : labels OK as BASELINE_OK
@@ -33,6 +30,7 @@ Exit codes:
 Usage:
   python validate_ap_status.py -x site_list.xlsx --tag pre
   python validate_ap_status.py -c site_list.csv --tag post
+  python validate_ap_status.py -x site_list.xlsx
 """
 
 import sys
@@ -50,6 +48,9 @@ from openpyxl import load_workbook
 ENV_FILE_DEFAULT = ".env"
 
 
+# ----------------------------
+# ENV
+# ----------------------------
 def load_env_file(path: str) -> Dict[str, str]:
     expanded = os.path.expanduser(path)
     if not os.path.exists(expanded):
@@ -97,6 +98,9 @@ def ok_label(tag: str) -> str:
     return "OK"
 
 
+# ----------------------------
+# Mist client (GET only)
+# ----------------------------
 class MistClient:
     def __init__(
         self,
@@ -139,6 +143,7 @@ class MistClient:
             try:
                 resp = self.session.get(url, params=params, timeout=self.timeout)
 
+                # Retry transient errors
                 if resp.status_code in (429, 500, 502, 503, 504):
                     if attempt < self.max_retries:
                         retry_after = resp.headers.get("Retry-After")
@@ -171,6 +176,9 @@ class MistClient:
         raise RuntimeError(f"GET {path} failed unexpectedly")
 
 
+# ----------------------------
+# Excel & CSV Input
+# ----------------------------
 def read_csv_rows(path: str) -> List[Dict[str, str]]:
     """Read CSV file with required columns: site_name, target_version, scope"""
     rows = []
@@ -239,7 +247,11 @@ def read_excel_rows(path: str, sheet_name: Optional[str] = None) -> List[Dict[st
     return out
 
 
+# ----------------------------
+# Site resolution
+# ----------------------------
 def build_site_map(client: MistClient, org_id: str) -> Dict[str, str]:
+    # Single page fetch; assumes <= 1000 sites. Your org ~450.
     sites = client.get(f"/orgs/{org_id}/sites", params={"limit": 1000, "page": 1})
     if not isinstance(sites, list):
         raise RuntimeError("Unexpected response when listing sites (expected a list)")
@@ -251,6 +263,9 @@ def get_site_devices(client: MistClient, site_id: str) -> List[Dict[str, Any]]:
     return data if isinstance(data, list) else []
 
 
+# ----------------------------
+# Device helpers
+# ----------------------------
 def device_name(d: Dict[str, Any]) -> str:
     return (d.get("name") or d.get("hostname") or d.get("device_name") or d.get("id") or "unknown").strip()
 
@@ -295,14 +310,14 @@ def evaluate_site(
     """
     Returns:
       eligible_count,
-      eligible_devices (ALL eligible devices),
-      flagged_devices (devices with issues),
+      eligible_devices (all eligible, for full visibility),
+      flagged_devices (device, issues),
       counts dict,
       skipped_reason ("" if not skipped)
     """
     eligible: List[Dict[str, Any]] = []
 
-    # Filter eligible devices based on scope
+    # Filter eligible
     for d in devices:
         model = device_model(d)
         if model not in allowed_models:
@@ -341,6 +356,9 @@ def evaluate_site(
     return len(eligible), eligible, flagged, counts, ""
 
 
+# ----------------------------
+# Main
+# ----------------------------
 def usage():
     print(
         """
@@ -371,7 +389,7 @@ Example:
 
 def main():
     input_file: Optional[str] = None
-    input_format = "xlsx"
+    input_format = "xlsx"  # "xlsx" or "csv"
     env_path: str = ENV_FILE_DEFAULT
     sheet_name: Optional[str] = None
     tag: str = ""
@@ -406,6 +424,7 @@ def main():
         print("Error: Input file is required (-x/--excel or -c/--csv)")
         usage()
 
+    # Load environment
     try:
         env = load_env_file(env_path)
     except Exception as e:
@@ -427,6 +446,7 @@ def main():
     proxies = {"http": proxy, "https": proxy} if proxy else None
     no_proxy = env.get("NO_PROXY")
 
+    # Initialize Mist client
     client = MistClient(
         base_url=base_url,
         token=token,
@@ -435,6 +455,7 @@ def main():
         max_retries=max_retries,
     )
 
+    # Read input file
     try:
         if input_format == "csv":
             rows = read_csv_rows(input_file)
@@ -444,12 +465,14 @@ def main():
         print(f"ERROR: Failed to read input file: {e}")
         sys.exit(1)
 
+    # Build site map
     try:
         site_map = build_site_map(client, org_id)
     except Exception as e:
         print(f"ERROR: Failed to load sites from Mist: {e}")
         sys.exit(1)
 
+    # Generate report
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     tag_part = f"_{tag}" if tag else ""
     report_path = f"upgrade_validation{tag_part}_{stamp}.txt"
@@ -493,48 +516,28 @@ def main():
                 continue
 
             if not flagged_devices:
-                # ✅ OK CASE: Show all eligible APs
                 lines.append(
                     f"{ok_word} | {site_name} | eligible={eligible_count} | target={target_version} | scope={scope}"
                 )
+                # Show ALL eligible APs with TARGET version and current version
                 for d in eligible_devices:
+                    current_ver = device_version(d)
                     lines.append(
                         f"  - {device_name(d)} [{device_model(d)}] status={device_status(d)} "
-                        f"version={device_version(d)}  OK"
+                        f"version={target_version} (current={current_ver})  OK"
                     )
                 ok += 1
             else:
-                # ✅ FLAGGED CASE: Show ALL eligible APs (with issues highlighted)
                 lines.append(
                     f"FLAGGED | {site_name} | eligible={eligible_count} | "
                     f"mismatched={counts['mismatched']} | disconnected={counts['disconnected']} | upgrading={counts['upgrading']}"
                 )
-                
-                # ✅ FIX: Show ALL eligible APs, not just flagged ones
-                flagged_set = {device_name(d) for d, _ in flagged_devices}
-                for d in eligible_devices:
-                    ap_name = device_name(d)
-                    
-                    # Find issues for this AP
-                    issues = []
-                    for fd, fi in flagged_devices:
-                        if device_name(fd) == ap_name:
-                            issues = fi
-                            break
-                    
-                    if issues:
-                        # AP has issues
-                        lines.append(
-                            f"  - {ap_name} [{device_model(d)}] status={device_status(d)} "
-                            f"version={device_version(d)}  {'; '.join(issues)}"
-                        )
-                    else:
-                        # AP is OK (even though site is flagged)
-                        lines.append(
-                            f"  - {ap_name} [{device_model(d)}] status={device_status(d)} "
-                            f"version={device_version(d)}  OK"
-                        )
-                
+                for d, issues in flagged_devices:
+                    current_ver = device_version(d)
+                    lines.append(
+                        f"  - {device_name(d)} [{device_model(d)}] status={device_status(d)} "
+                        f"version={target_version} (current={current_ver})  {'; '.join(issues)}"
+                    )
                 flagged += 1
 
         except Exception as e:
@@ -549,6 +552,7 @@ def main():
     lines.append(f"  SKIPPED: {skipped}")
     lines.append(f"  Report file: {report_path}")
 
+    # Write report
     try:
         with open(report_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -557,6 +561,7 @@ def main():
         print(f"ERROR: Failed to write report: {e}")
         sys.exit(1)
 
+    # Print summary to console
     print("\n" + "=" * 80)
     print("SUMMARY")
     print("=" * 80)
@@ -566,10 +571,11 @@ def main():
     print(f"  SKIPPED: {skipped}")
     print("=" * 80)
 
+    # Determine exit code
+    # Fail if any sites flagged, OR all sites skipped (likely config issue)
     if flagged > 0:
-        print(f"\n⚠️  WARNING: {flagged} site(s) have issues but proceeding anyway")
-    # Don't exit with 1 - let pipeline continue
-        sys.exit(0)
+        print(f"\n❌ FAILED: {flagged} site(s) flagged")
+        sys.exit(1)
 
     if skipped == total and total > 0:
         print(f"\n⚠️  WARNING: All {total} site(s) were skipped (possible configuration issue)")
