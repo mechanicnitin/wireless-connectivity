@@ -70,7 +70,7 @@ def parse_baseline():
 def run_post_validation(csv_file):
     cmd = [
         "python",
-        "validate_ap_status.py",
+        "Dev/AP upgrade/validate_ap_status.py",
         "-c", csv_file,
         "--tag", "post"
     ]
