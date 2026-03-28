@@ -2,8 +2,21 @@
 """
 Validate AP firmware status per site (pre/post-check), driven by Excel/CSV.
 
-PRE-VALIDATION: Captures baseline - only checks connectivity, NOT version
-POST-VALIDATION: Checks both connectivity AND target version
+PRE-VALIDATION: Captures baseline - only checks connectivity, NOT version.
+  AP classification per device:
+    READY_FOR_UPGRADE  - connected, version != target
+    ALREADY_COMPLIANT  - connected, version == target
+    DISCONNECTED       - offline
+
+  Site-level:
+    scope=all      → FLAGGED if ANY AP is disconnected
+    scope=connected → disconnected APs are informational only; site is
+                      BASELINE_OK when at least one AP is connected
+
+POST-VALIDATION: Checks both connectivity AND target version.
+  Site is FLAGGED if ANY AP (that is in scope) fails a check.
+  scope=all      → disconnected APs count as failures
+  scope=connected → only connected APs are evaluated
 
 Inputs:
 - Excel/CSV columns required: site_name, target_version, scope
@@ -11,19 +24,6 @@ Inputs:
     MIST_BASE_URL
     MIST_ORG_ID
     MIST_ACCESS_TOKEN
-
-Reporting rules:
-  PRE (baseline capture):
-    OK | <site> | eligible=<n> | target=<ver> | scope=<scope>
-      - <ap> [<model>] status=<status> version=<current>  OK
-    FLAGGED (disconnected APs - informational)
-      - <ap> [<model>] status=<status> version=<current>  STATUS=disconnected
-  
-  POST (upgrade validation):
-    SUCCESS | <site> | eligible=<n> | target=<ver> | scope=<scope>
-      - <ap> [<model>] status=<status> version=<current>  OK (at target)
-    FLAGGED (connectivity or version issues)
-      - <ap> [<model>] status=<status> version=<current>  VERSION_MISMATCH or STATUS=disconnected
 
 Exit codes:
 - 0: All eligible sites OK (pre) or SUCCESS (post)
@@ -300,40 +300,71 @@ def is_upgrade_in_progress(state: Optional[str]) -> bool:
     return any(x in s for x in ("download", "downloading", "upgrade", "upgrading", "install", "installing", "reboot"))
 
 
+def classify_ap_pre(
+    d: Dict[str, Any],
+    target_version: str,
+) -> str:
+    """
+    Classify a single AP for pre-validation.
+
+    Returns one of:
+      READY_FOR_UPGRADE  - connected, current version != target
+      ALREADY_COMPLIANT  - connected, current version == target
+      DISCONNECTED       - offline
+    """
+    status = device_status(d)
+    if status != "connected":
+        return "DISCONNECTED"
+    version = device_version(d)
+    if version == target_version:
+        return "ALREADY_COMPLIANT"
+    return "READY_FOR_UPGRADE"
+
+
 def evaluate_site_pre(
     devices: List[Dict[str, Any]],
     scope: str,
     allowed_models: List[str],
+    target_version: str = "",
 ) -> Tuple[int, List[Dict[str, Any]], List[Tuple[Dict[str, Any], List[str]]], str]:
     """
-    PRE-VALIDATION: Just capture baseline, don't flag for version mismatch
-    
+    PRE-VALIDATION: Capture baseline with AP-level classification.
+
+    Scope rules:
+      scope=all       → FLAGGED if ANY AP is disconnected
+      scope=connected → disconnected APs are informational; site is
+                        BASELINE_OK when at least one AP is connected
+
     Returns:
       eligible_count,
-      eligible_devices (all connected eligible),
-      flagged_devices (only disconnected ones - informational),
+      eligible_devices  (READY_FOR_UPGRADE + ALREADY_COMPLIANT),
+      flagged_devices   (DISCONNECTED, and always-informational for connected scope),
       skipped_reason
     """
     eligible: List[Dict[str, Any]] = []
     flagged: List[Tuple[Dict[str, Any], List[str]]] = []
 
-    # Filter eligible by model
     for d in devices:
         model = device_model(d)
         if model not in allowed_models:
             continue
-        
-        status = device_status(d)
-        
-        if status == "disconnected":
-            # Track disconnected APs (informational)
+
+        classification = classify_ap_pre(d, target_version)
+
+        if classification == "DISCONNECTED":
             flagged.append((d, ["STATUS=disconnected"]))
         else:
-            # Connected APs are eligible
+            # READY_FOR_UPGRADE or ALREADY_COMPLIANT
             eligible.append(d)
 
     if not eligible and not flagged:
         return 0, [], [], "no eligible APs"
+
+    # scope=all: any disconnected AP flips the site to FLAGGED
+    # scope=connected: disconnected APs are purely informational
+    if scope == "all" and flagged:
+        # Return 0 eligible so the caller marks the site FLAGGED
+        return 0, [], flagged, ""
 
     return len(eligible), eligible, flagged, ""
 
@@ -345,40 +376,50 @@ def evaluate_site_post(
     allowed_models: List[str],
 ) -> Tuple[int, List[Dict[str, Any]], List[Tuple[Dict[str, Any], List[str]]], str]:
     """
-    POST-VALIDATION: Check both connectivity AND version
-    
+    POST-VALIDATION: Check connectivity AND version per AP.
+
+    KEY FIX - partial success is now a failure:
+      A site is FLAGGED if ANY in-scope AP fails a check.
+      Previously a site passed if at least one AP was OK; that masked
+      APs stuck on old firmware.
+
+    Scope rules:
+      scope=all       → disconnected APs are failures
+      scope=connected → disconnected APs are skipped entirely (not evaluated)
+
     Returns:
       eligible_count,
-      eligible_devices (all connected eligible),
-      flagged_devices (those with issues),
+      eligible_devices  (all checks passed),
+      flagged_devices   (any check failed),
       skipped_reason
     """
     eligible: List[Dict[str, Any]] = []
     flagged: List[Tuple[Dict[str, Any], List[str]]] = []
 
-    # Filter eligible by model
     for d in devices:
         model = device_model(d)
         if model not in allowed_models:
             continue
-        
+
         status = device_status(d)
         version = device_version(d)
         upgrade_state = device_upgrade_state(d)
-        
+
+        # scope=connected: skip offline APs entirely - they are not in scope
+        if scope == "connected" and status != "connected":
+            continue
+
         issues: List[str] = []
 
-        # Check status
         if status != "connected":
             issues.append(f"STATUS={status}")
         
-        # Check version
-        if version != target_version:
-            issues.append(f"VERSION_MISMATCH(current={version})")
-        
-        # Check upgrade state
-        if is_upgrade_in_progress(upgrade_state):
-            issues.append(f"UPGRADE_IN_PROGRESS({upgrade_state})")
+        if status == "connected":
+            # Only check version/upgrade for connected APs to avoid noise
+            if version != target_version:
+                issues.append(f"VERSION_MISMATCH(current={version})")
+            if is_upgrade_in_progress(upgrade_state):
+                issues.append(f"UPGRADE_IN_PROGRESS({upgrade_state})")
 
         if issues:
             flagged.append((d, issues))
@@ -407,8 +448,13 @@ Optional:
   -e, --env=          Env file path (default: ./.env)
   --sheet=            Sheet name (Excel only, default: first sheet)
   --tag=              Tag for reporting (pre|post, default: none)
-                      pre  → baseline capture (only checks connectivity)
+                      pre  → baseline capture; AP classification shown
+                             scope=all:       FLAGGED if any AP disconnected
+                             scope=connected: disconnected APs informational only
                       post → upgrade validation (checks connectivity + version)
+                             ANY AP failing a check flags the site (partial success = failure)
+                             scope=all:       disconnected APs are failures
+                             scope=connected: disconnected APs skipped
 
 Exit codes:
   0: All eligible sites OK
@@ -546,7 +592,7 @@ def main():
             if is_pre:
                 # PRE-VALIDATION: only check connectivity
                 eligible_count, eligible_devices, flagged_devices, skip_reason = evaluate_site_pre(
-                    devices, scope, allowed_models
+                    devices, scope, allowed_models, target_version
                 )
             else:
                 # POST-VALIDATION: check connectivity + version
@@ -559,9 +605,22 @@ def main():
                 skipped += 1
                 continue
 
-            # Only flagged if there are issues AND no eligible devices
-            if flagged_devices and not eligible_devices:
-                lines.append(f"FLAGGED | {site_name} | eligible={eligible_count} | issues found")
+            # KEY FIX: flag if ANY AP has issues (partial success = failure).
+            # Previously only flagged when eligible_devices was empty, which
+            # allowed sites with most-APs-OK to silently pass.
+            if flagged_devices:
+                lines.append(
+                    f"FLAGGED | {site_name} | eligible={eligible_count} "
+                    f"| flagged={len(flagged_devices)} | target={target_version} | scope={scope}"
+                )
+                # Show passing APs first for context
+                for d in eligible_devices:
+                    ap_class = classify_ap_pre(d, target_version) if is_pre else "OK"
+                    lines.append(
+                        f"  - {device_name(d)} [{device_model(d)}] status={device_status(d)} "
+                        f"version={device_version(d)}  {ap_class}"
+                    )
+                # Then show failing APs
                 for d, issues in flagged_devices:
                     lines.append(
                         f"  - {device_name(d)} [{device_model(d)}] status={device_status(d)} "
@@ -569,24 +628,19 @@ def main():
                     )
                 flagged += 1
             elif eligible_count > 0:
-                # OK: show all eligible devices
+                # All in-scope APs passed
                 lines.append(
                     f"{ok_word} | {site_name} | eligible={eligible_count} | target={target_version} | scope={scope}"
                 )
                 for d in eligible_devices:
+                    ap_class = classify_ap_pre(d, target_version) if is_pre else "OK"
                     lines.append(
                         f"  - {device_name(d)} [{device_model(d)}] status={device_status(d)} "
-                        f"version={device_version(d)}  OK"
-                    )
-                # Also show flagged (informational)
-                for d, issues in flagged_devices:
-                    lines.append(
-                        f"  - {device_name(d)} [{device_model(d)}] status={device_status(d)} "
-                        f"version={device_version(d)}  {'; '.join(issues)}"
+                        f"version={device_version(d)}  {ap_class}"
                     )
                 ok += 1
             else:
-                # No eligible devices found
+                # No in-scope devices found at all
                 lines.append(f"FLAGGED | {site_name} | reason=no eligible devices")
                 flagged += 1
 
@@ -596,11 +650,13 @@ def main():
 
     lines.append("-" * 80)
     lines.append("SUMMARY")
-    lines.append(f"  Sites processed: {total}")
-    lines.append(f"  {ok_word}: {ok}")
-    lines.append(f"  FLAGGED: {flagged}")
-    lines.append(f"  SKIPPED: {skipped}")
-    lines.append(f"  Report file: {report_path}")
+    lines.append(f"  Sites processed : {total}")
+    lines.append(f"  {ok_word}        : {ok}")
+    lines.append(f"  FLAGGED         : {flagged}")
+    lines.append(f"  SKIPPED         : {skipped}")
+    if is_pre:
+        lines.append("  (AP classification: READY_FOR_UPGRADE / ALREADY_COMPLIANT / DISCONNECTED)")
+    lines.append(f"  Report file     : {report_path}")
 
     # Write report
     try:
@@ -615,10 +671,12 @@ def main():
     print("\n" + "=" * 80)
     print("SUMMARY")
     print("=" * 80)
-    print(f"  Sites processed: {total}")
-    print(f"  {ok_word}: {ok}")
-    print(f"  FLAGGED: {flagged}")
-    print(f"  SKIPPED: {skipped}")
+    print(f"  Sites processed : {total}")
+    print(f"  {ok_word}        : {ok}")
+    print(f"  FLAGGED         : {flagged}")
+    print(f"  SKIPPED         : {skipped}")
+    if is_pre:
+        print("  (AP labels: READY_FOR_UPGRADE / ALREADY_COMPLIANT / DISCONNECTED)")
     print("=" * 80)
 
     # Determine exit code
