@@ -121,11 +121,9 @@ jobs:
       # ============================================================================
       - name: Wait for AP stabilization
         run: |
-          SCOPE=$(head -2 "Dev/AP upgrade/site_list.csv" | tail -1 | cut -d',' -f3 | xargs)
           python "Dev/AP upgrade/wait_for_ap_stabilization.py" \
             -c "Dev/AP upgrade/site_list.csv" \
             --target-version "$TARGET_VERSION" \
-            --scope "$SCOPE" \
             --env .env
 
       - name: Fail if stabilization timeout
