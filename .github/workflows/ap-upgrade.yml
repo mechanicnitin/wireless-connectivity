@@ -132,7 +132,6 @@ jobs:
             python "Dev/AP upgrade/wait_for_ap_stabilization.py" \
             -c "Dev/AP upgrade/site_list.csv" \
             --target-version "${{ steps.extract_version.outputs.target_version }}" \
-            --env .env
 
       - name: Fail if stabilization timeout
         if: steps.stabilization.outcome == 'failure'
