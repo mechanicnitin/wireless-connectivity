@@ -72,7 +72,6 @@ jobs:
           python "Dev/AP upgrade/validate_ap_status.py" \
             -c "Dev/AP upgrade/site_list.csv" \
             --tag pre \
-            --env .env
         continue-on-error: true
 
       - name: Upload report
