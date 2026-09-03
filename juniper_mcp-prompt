@@ -1,0 +1,1511 @@
+Absolutely. Based on everything we've built and learned through the v1.3.x iterations, I would give Claude a **single master prompt** that explains the objective, existing architecture, lessons from the AP03/AP07 investigation, and exactly how we want the troubleshooting engine to behave.
+
+You can paste the following into the **fresh Claude chat where you've uploaded the latest ZIP**.
+
+---
+
+# MASTER PROMPT — Juniper Mist AI Troubleshooting Engine
+
+You are working on an existing **Juniper Mist AI/MCP troubleshooting engine**.
+
+The uploaded ZIP is the current baseline package. **Do not rewrite the package from scratch. Do not redesign the architecture. Do not remove or weaken existing working modules.**
+
+Your job is to understand the existing implementation first, then improve the investigation/orchestration logic so that the engine behaves like a disciplined wireless troubleshooting engineer rather than a generic LLM.
+
+---
+
+# 1. What we are building
+
+We are building an AI-driven troubleshooting engine around **Juniper Mist MCP / Marvis operational data**.
+
+A user should be able to simply say:
+
+```text
+troubleshoot client <MAC>
+```
+
+or:
+
+```text
+troubleshoot <MAC>
+```
+
+without giving Claude a detailed investigation prompt.
+
+The orchestrator itself must determine what evidence is required and perform the appropriate investigation.
+
+The engine must work across multiple wireless symptoms, not only authentication problems.
+
+Examples:
+
+```text
+Wi-Fi is slow
+I can't connect to Wi-Fi
+I get disconnected all the time
+When I walk around I lose my connection
+My voice quality is bad
+My ping is high
+I cannot associate
+I cannot authenticate
+I am connected but don't get an IP address
+Client keeps roaming
+Client keeps reconnecting
+```
+
+The troubleshooting engine must therefore be **symptom-aware but evidence-driven**.
+
+---
+
+# 2. Core philosophy
+
+The most important principle is:
+
+> **Do not jump from an observed event to a root cause.**
+
+The engine must distinguish between:
+
+### Observed
+
+Something directly present in MCP telemetry / packet capture.
+
+Example:
+
+```text
+CLIENT_AUTH_FAILURE
+AP03
+RSSI -50 dBm
+auth_type=eap
+RADIUS=10.251.0.103
+```
+
+### Correlated
+
+Two or more observed events line up temporally or causally.
+
+Example:
+
+```text
+AP restart
+↓
+client reconnect
+↓
+FT/PMKID failure
+↓
+full EAP fallback
+```
+
+### Hypothesis
+
+A technically plausible explanation.
+
+Example:
+
+```text
+PMK cache invalidation may have contributed to FT failure.
+```
+
+### Confirmed
+
+The available evidence directly establishes the mechanism.
+
+Do NOT label a hypothesis as confirmed merely because it is plausible.
+
+---
+
+# 3. Broad-first investigation is mandatory
+
+When troubleshooting a client, the engine should first establish the overall client story.
+
+At minimum, depending on the symptom, retrieve/correlate:
+
+* client identity
+* current AP
+* historical APs
+* AP/BSSID sequence
+* timestamps
+* association events
+* reassociation events
+* authentication events
+* authentication failures
+* 802.11r / FT events
+* PMKID/FBT events
+* roaming events
+* roaming-not-fast events
+* RSSI
+* SNR/noise where available
+* channel
+* band
+* WLAN/SSID
+* security/key-management
+* PMF where available
+* RADIUS server
+* RADIUS response/failure information
+* DHCP
+* ARP
+* DNS
+* client IP
+* AP health
+* AP restart/reboot events
+* AP alarms
+* switch/port information where available
+* PCAP references
+* other relevant Marvis events
+
+Do not depend on the user to tell you which specific fields to investigate.
+
+---
+
+# 4. Timeline is the central object
+
+The engine should construct a normalized chronological timeline.
+
+Every event should be represented conceptually as:
+
+```text
+timestamp
+client
+AP/BSSID
+previous AP
+next AP
+event type
+event result
+RSSI
+channel/band
+authentication method
+RADIUS server
+PMF
+FT/11r state
+DHCP/IP state
+PCAP availability
+```
+
+The timeline should be used to reason about the incident.
+
+---
+
+# 5. HARD EVENT ATTRIBUTION GUARDRAIL
+
+This is extremely important.
+
+The engine must NEVER assign an event to an AP merely because it appears near another event in the timeline.
+
+Before saying:
+
+```text
+AP03 experienced X
+```
+
+validate:
+
+```text
+timestamp
++
+client
++
+AP/BSSID
++
+event type
++
+client state
+```
+
+Where applicable also validate:
+
+```text
+previous AP
+next AP
+```
+
+Example:
+
+```text
+AP03 → AP04
+```
+
+If an event actually belongs to AP04, it must not be attributed to AP03 simply because it occurred during the same roaming sequence.
+
+This was identified as an actual failure mode during our investigation.
+
+---
+
+# 6. Roaming analysis
+
+Separate these two questions:
+
+### Question A
+
+> Did the client roam?
+
+This can often be established from telemetry.
+
+### Question B
+
+> Why did the client roam?
+
+This usually cannot be established merely from the fact that a roam occurred.
+
+Possible hypotheses include:
+
+* client roaming algorithm
+* RF conditions
+* RSSI
+* SNR
+* AP/client asymmetry
+* near/far effect
+* AP transmit power
+* 802.11k
+* 802.11v
+* 802.11r
+* FT behavior
+* client steering
+* AP steering
+* load balancing
+* band preference
+* client policy
+* application behavior
+* AP health
+
+The engine must not select one merely because it sounds technically reasonable.
+
+---
+
+# 7. Full EAP vs 802.11r/FT differential analysis
+
+Authentication troubleshooting must explicitly distinguish:
+
+```text
+Full EAP / 802.1X
+```
+
+from:
+
+```text
+802.11r / FT
+```
+
+Relevant fields include:
+
+```text
+auth_type
+eap
+eap-11r
+key_mgmt
+PMF
+previous AP
+time_since_assoc
+RADIUS server
+EAP events
+FT/FBT events
+PMKID
+RSSI
+timestamps
+```
+
+But do NOT assume:
+
+```text
+long time_since_assoc
+→
+FT impossible
+→
+EAP failure
+```
+
+We discovered that `time_since_assoc` can correlate with `auth_type`, but it is not necessarily the causal mechanism.
+
+Therefore:
+
+> A correlated field must not automatically become the root cause.
+
+---
+
+# 8. Same-client differential analysis
+
+Whenever possible compare:
+
+```text
+same client
+same WLAN
+same AP
+successful attempt
+vs
+failed attempt
+```
+
+Then compare:
+
+* auth_type
+* key management
+* PMF
+* RSSI
+* previous AP
+* time_since_assoc
+* RADIUS
+* EAP events
+* FT events
+* timestamps
+* AP state
+
+Then perform:
+
+> **Minimum differentiating factor analysis**
+
+Ask:
+
+> What is the smallest observed difference that consistently separates success from failure?
+
+Do not assume that the first correlated difference is causal.
+
+---
+
+# 9. Peer-AP control comparison
+
+A critical improvement from our AP03 investigation:
+
+Never analyze an AP in isolation if peer AP data is available.
+
+Compare:
+
+```text
+suspect AP
+vs
+healthy AP
+```
+
+using the same:
+
+* client
+* WLAN
+* authentication infrastructure
+* firmware
+* AP model
+* security
+* RADIUS
+* RF environment where possible
+
+Example:
+
+```text
+AP03
+AP04
+AP07
+```
+
+If the same client can perform full EAP successfully on AP04/AP07 but fails on AP03, that is meaningful.
+
+However, do not stop there.
+
+---
+
+# 10. Peer-normalized failure-rate analysis
+
+A major lesson from the later investigation:
+
+The existence of the same failure event on another AP does NOT automatically prove that the suspect AP is healthy.
+
+Conversely:
+
+One failure on the suspect AP does NOT prove that the AP is faulty.
+
+When enough data exists, calculate:
+
+```text
+AP03:
+failures / attempts
+
+AP04:
+failures / attempts
+
+AP07:
+failures / attempts
+
+other APs:
+failures / attempts
+```
+
+Then determine whether the suspect AP is statistically/differentially abnormal relative to its peer population.
+
+The engine should distinguish:
+
+### Shared failure signature
+
+```text
+Multiple APs experience authentication failures.
+```
+
+from:
+
+### AP-specific differential
+
+```text
+AP03 has materially higher failure frequency
+than comparable APs.
+```
+
+Both pieces of evidence should remain visible.
+
+Do not allow a broad site-wide pattern to erase a potentially meaningful AP-specific differential.
+
+---
+
+# 11. AP replacement / relocation is a CONTROLLED INTERVENTION
+
+This is one of the most important lessons from the actual investigation.
+
+We physically replaced:
+
+```text
+AP03
+```
+
+with:
+
+```text
+AP07
+```
+
+in AP03's original location.
+
+The client subsequently worked successfully in that location with AP07.
+
+AP03 was then moved to the other location.
+
+The same client was tested against AP03 in the new location:
+
+```text
+attempt 1 → connected
+forced reconnect
+attempt 2 → failed to connect
+```
+
+This is highly valuable evidence because it separates:
+
+```text
+LOCATION
+```
+
+from:
+
+```text
+AP IDENTITY
+```
+
+Conceptually:
+
+```text
+Original location
+       |
+       +--- AP03 → problem
+       |
+       +--- AP07 → works
+```
+
+and:
+
+```text
+New location
+       |
+       +--- AP03 → problem reproduced
+```
+
+This increases confidence that the issue may follow the AP rather than the physical location.
+
+The engine must explicitly recognize this as:
+
+> **Controlled intervention evidence**
+
+and increase AP-specific confidence accordingly.
+
+But do NOT automatically say:
+
+> "AP03 hardware is defective."
+
+The correct conclusion may be:
+
+> "The observed client connectivity issue followed AP03 across locations while AP07 operated successfully in AP03's former location, providing strong AP-identity evidence. The internal mechanism remains unconfirmed."
+
+---
+
+# 12. Replacement AP must NOT inherit historical fault evidence
+
+This is another critical guardrail.
+
+If:
+
+```text
+AP03 was replaced by AP07
+```
+
+events generated by the replacement/test activity must not cause AP07 to be incorrectly classified as faulty.
+
+For example:
+
+```text
+AP07 reboot
+AP07 disconnect
+AP07 association changes
+```
+
+around the replacement time may simply be expected intervention activity.
+
+The orchestrator must correlate:
+
+```text
+event timestamp
++
+known intervention window
++
+AP identity
++
+admin/config events
++
+replacement history
+```
+
+before scoring AP health.
+
+---
+
+# 13. Reboot causality
+
+Do not treat every AP reboot as the cause of a client problem.
+
+Distinguish:
+
+### Admin-triggered
+
+```text
+AP_CONFIG_CHANGED_BY_USER
+↓
+AP_RESTARTED
+```
+
+### Unexplained
+
+```text
+AP_DISCONNECTED
+↓
+AP_RESTARTED
+↓
+AP_CONNECTED
+```
+
+The second is an anomaly, but anomaly ≠ root cause.
+
+The engine must ask:
+
+```text
+Did the client failure occur AFTER the reboot?
+```
+
+and:
+
+```text
+Is the reboot temporally close enough?
+```
+
+and:
+
+```text
+Does the same behavior occur independently of the reboot?
+```
+
+A reboot that happened after the original failure cannot be used to explain that historical failure.
+
+---
+
+# 14. Firmware/model/config parity
+
+When comparing APs, automatically check where MCP exposes the information:
+
+* model
+* firmware
+* hardware revision
+* WLAN configuration
+* security
+* RADIUS configuration
+* switch
+* port
+* channel
+* band
+* uptime
+* reboot history
+
+In our environment:
+
+```text
+AP03 = AP45
+AP04 = AP45
+AP07 = AP45
+
+Firmware:
+0.14.29967
+```
+
+So firmware/model/hardware revision were not differentiators.
+
+Do not repeatedly use already-ruled-out differences as RCA candidates.
+
+---
+
+# 15. RADIUS analysis
+
+Do not conclude:
+
+```text
+RADIUS server X is bad
+```
+
+just because a failure references that server.
+
+Compare:
+
+* server
+* request count
+* accept/reject
+* timeout
+* latency if available
+* same server succeeding on other APs
+* EAP sequence
+* timestamp
+
+Also:
+
+> Never populate a blank RADIUS `ip` field using an assumption from another aggregate field.
+
+Blank means unknown.
+
+---
+
+# 16. PCAP AUTOMATIC RETRIEVAL
+
+This is now a core part of the troubleshooting engine.
+
+If an MCP event contains:
+
+```text
+pcap_url
+```
+
+or:
+
+```text
+has_pcap=true
+```
+
+the orchestrator should automatically attempt to retrieve the capture.
+
+The user should NOT have to explicitly tell Claude:
+
+```text
+download the PCAP
+```
+
+The workflow must be:
+
+```text
+MCP event
+ ↓
+pcap_url discovered
+ ↓
+automatic retrieval attempt
+ ↓
+SUCCESS?
+```
+
+### If successful:
+
+```text
+download
+ ↓
+validate file
+ ↓
+identify PCAP/PCAPNG
+ ↓
+parse
+ ↓
+extract relevant time window
+ ↓
+filter client/AP/BSSID
+ ↓
+analyze relevant packets
+ ↓
+correlate with MCP events
+```
+
+---
+
+# 17. PCAP time-window extraction
+
+Do NOT necessarily analyze the entire capture.
+
+Use the event timestamp and surrounding context.
+
+Example:
+
+```text
+event = 15:49:09
+```
+
+Analyze an appropriate window around that event, for example:
+
+```text
+T - X seconds
+to
+T + Y seconds
+```
+
+The exact window should be adaptive based on the event type.
+
+For authentication:
+
+```text
+EAPOL Start
+EAP
+RADIUS-related exchange where visible
+EAP success/failure
+4-way handshake
+disconnect/deauth
+```
+
+For FT:
+
+```text
+FT authentication
+Reassociation
+FT action frames
+PMKID-related behavior
+authentication exchange
+```
+
+For DHCP:
+
+```text
+DHCP Discover
+Offer
+Request
+ACK
+NAK
+```
+
+For DNS:
+
+```text
+DNS query
+response
+retransmission
+timeout
+```
+
+For high latency:
+
+```text
+ICMP request/reply
+TCP retransmissions
+application-relevant traffic where available
+```
+
+For roaming:
+
+```text
+old AP
+roam trigger timeframe
+authentication
+reassociation
+new AP
+post-roam traffic
+```
+
+---
+
+# 18. PCAP must CORRELATE with MCP
+
+PCAP analysis is not a standalone report.
+
+The engine must correlate:
+
+```text
+MCP timestamp
++
+PCAP timestamp
++
+client MAC
++
+AP/BSSID
++
+event
+```
+
+Example:
+
+```text
+MCP:
+AP03 authentication failure
+15:54:23
+
+PCAP:
+EAPOL Start
+15:54:22.812
+
+EAP exchange
+15:54:23.xxx
+
+No response / timeout
+15:54:xx
+
+↓
+```
+
+This can materially increase confidence.
+
+But only if the packet evidence actually supports the interpretation.
+
+---
+
+# 19. PCAP retrieval failure must NOT stop troubleshooting
+
+Our Claude environment currently may block:
+
+```text
+api.ac5.mist.com
+```
+
+through an egress host allowlist.
+
+We observed:
+
+```text
+DNS → success
+TCP → success
+TLS → success
+HTTP → 403 host_not_allowed
+```
+
+Therefore:
+
+```text
+PCAP reference exists
+```
+
+is NOT equivalent to:
+
+```text
+PCAP downloaded
+```
+
+The engine must maintain explicit states:
+
+```text
+PCAP_REFERENCE_FOUND
+PCAP_RETRIEVAL_ATTEMPTED
+PCAP_RETRIEVAL_SUCCESS
+PCAP_RETRIEVAL_BLOCKED
+PCAP_VALIDATED
+PCAP_PARSE_SUCCESS
+PCAP_PARSE_FAILED
+```
+
+If retrieval is blocked:
+
+```text
+continue MCP investigation
+```
+
+and report:
+
+> PCAP was available but could not be retrieved because of the execution environment.
+
+Do not call this a Mist failure.
+
+---
+
+# 20. Manual PCAP attachment
+
+If the user manually attaches the PCAP because automatic retrieval is unavailable:
+
+The engine should recognize that this is the same evidence source and automatically perform:
+
+```text
+PCAP ingestion
+↓
+validation
+↓
+time-window extraction
+↓
+client/AP filtering
+↓
+packet analysis
+↓
+correlation with MCP timeline
+↓
+update confidence
+```
+
+The user should not need to provide another complicated prompt.
+
+---
+
+# 21. Packet-analysis honesty rule
+
+Never fabricate packet findings.
+
+If:
+
+```text
+PCAP unavailable
+```
+
+say:
+
+```text
+No packet-level conclusion possible.
+```
+
+If:
+
+```text
+PCAP retrieved but parser unavailable
+```
+
+say:
+
+```text
+Capture retrieved but packet-level analysis could not be performed.
+```
+
+If:
+
+```text
+PCAP successfully parsed
+```
+
+only then report packet-level findings.
+
+---
+
+# 22. Cross-symptom architecture
+
+The same evidence engine must support all of these:
+
+### Slow Wi-Fi
+
+Investigate:
+
+* RSSI
+* SNR
+* retries
+* PHY rate
+* channel utilization
+* interference
+* band
+* AP health
+* client capabilities
+* packet loss
+* latency
+* retransmissions
+
+### Can't connect
+
+Separate:
+
+```text
+association failure
+authentication failure
+DHCP failure
+```
+
+Do not collapse them into "Wi-Fi problem."
+
+### Repeated disconnects
+
+Investigate:
+
+* deauth/disassoc reason
+* AP/client
+* RF
+* authentication
+* roaming
+* AP restart
+* DHCP/IP
+* timestamps
+* recurrence
+
+### Roaming problems
+
+Investigate:
+
+* AP sequence
+* RSSI
+* SNR
+* 11k
+* 11v
+* 11r
+* FT
+* reassociation
+* roam timing
+* packet loss around roam
+
+Separate:
+
+```text
+roam occurred
+```
+
+from:
+
+```text
+roam was necessary
+```
+
+and:
+
+```text
+roam caused the failure
+```
+
+### Voice quality
+
+Investigate:
+
+* RSSI/SNR
+* retries
+* packet loss
+* latency
+* jitter if available
+* roaming
+* channel utilization
+* PHY rate
+* DSCP/WMM where available
+* AP health
+
+### High ping
+
+Investigate:
+
+```text
+client → AP
+AP → network
+DNS
+gateway
+WAN
+```
+
+and distinguish wireless latency from upstream latency.
+
+### Association failure
+
+Focus on:
+
+```text
+802.11 association
+status/reason codes
+RF
+capabilities
+PMF
+band
+AP state
+```
+
+### Authentication failure
+
+Focus on:
+
+```text
+802.1X
+EAP
+RADIUS
+FT/11r
+PMF
+key management
+AP
+client
+timestamps
+PCAP
+```
+
+### DHCP/IP failure
+
+Focus on:
+
+```text
+association
+authentication
+DHCP Discover
+Offer
+Request
+ACK
+ARP
+VLAN
+gateway
+```
+
+Do not diagnose DHCP if the client never successfully authenticated.
+
+---
+
+# 23. Evidence hierarchy
+
+Use this hierarchy:
+
+### Highest confidence
+
+Direct packet-level evidence + matching MCP event + correct AP/client attribution.
+
+### High confidence
+
+Repeated MCP evidence + controlled intervention + peer comparison.
+
+### Medium confidence
+
+Repeated correlated telemetry without direct mechanism.
+
+### Low confidence
+
+Single event / plausible technical hypothesis.
+
+### Unknown
+
+Insufficient evidence.
+
+The engine should expose this explicitly.
+
+---
+
+# 24. Contradiction handling
+
+The investigation must actively search for evidence that disproves the current hypothesis.
+
+Example:
+
+Initial hypothesis:
+
+```text
+RADIUS server is bad.
+```
+
+Then discover:
+
+```text
+same RADIUS server
++
+same client
++
+same WLAN
++
+successful authentication through AP04
+```
+
+The hypothesis confidence must decrease.
+
+Similarly:
+
+```text
+AP03 suspected
+```
+
+Then discover:
+
+```text
+same failure signature
+across AP01/AP02/AP04/AP05/AP06/AP07
+```
+
+This weakens the AP03-only theory.
+
+But if controlled replacement testing shows:
+
+```text
+problem follows AP03
+```
+
+that evidence must increase AP-specific confidence again.
+
+The engine must **balance evidence**, not simply overwrite old conclusions.
+
+---
+
+# 25. Do not confuse symptom with mechanism
+
+For example:
+
+```text
+Observed:
+client authentication failed.
+```
+
+does NOT mean:
+
+```text
+Root cause:
+RADIUS problem.
+```
+
+Likewise:
+
+```text
+Observed:
+client roamed.
+```
+
+does NOT mean:
+
+```text
+Root cause:
+RF problem.
+```
+
+Likewise:
+
+```text
+Observed:
+FT failed.
+```
+
+does NOT automatically mean:
+
+```text
+AP has broken 802.11r.
+```
+
+---
+
+# 26. Final RCA format
+
+Every investigation should ultimately produce:
+
+## Executive summary
+
+What happened?
+
+## Timeline
+
+Chronological sequence.
+
+## What is confirmed
+
+Directly supported facts.
+
+## What is strongly supported
+
+Repeated/correlated evidence.
+
+## What is only a hypothesis
+
+Technically plausible but unconfirmed mechanisms.
+
+## What has been ruled out
+
+Based on actual comparative evidence.
+
+## Differential analysis
+
+Suspect AP/client vs healthy controls.
+
+## PCAP evidence
+
+Downloaded/parsed/blocked/not available.
+
+## Confidence
+
+For example:
+
+```text
+AP-specific involvement: High
+RADIUS-wide issue: Low
+RF cause: Low
+Internal AP mechanism: Unknown
+```
+
+## Recommended next action
+
+Only recommend tests that can actually discriminate between the remaining hypotheses.
+
+---
+
+# 27. Most important lessons from AP03 investigation
+
+Use the following investigation history as design requirements.
+
+We initially observed:
+
+```text
+AP03 full-EAP failures
+```
+
+and:
+
+```text
+AP03 FT success
+```
+
+This initially suggested:
+
+```text
+AP03 full-EAP path problem.
+```
+
+Then we discovered:
+
+```text
+same authentication failure signature
+on multiple other APs.
+```
+
+Therefore the engine correctly had to reduce confidence in the AP03-only theory.
+
+At the same time, controlled replacement testing showed:
+
+```text
+AP03 removed from original location
+↓
+AP07 installed
+↓
+client works
+
+AP03 moved to another location
+↓
+same client tested
+↓
+initial connection succeeds
+↓
+forced reconnect
+↓
+connection failure
+```
+
+That is important AP-identity evidence.
+
+Therefore the correct engine behavior is:
+
+```text
+Site-wide authentication failures
+        +
+AP03-specific differential evidence
+        +
+Controlled AP replacement evidence
+        +
+PCAP evidence where available
+        ↓
+Balanced RCA confidence
+```
+
+Not:
+
+```text
+One failure
+↓
+AP03 faulty
+```
+
+and not:
+
+```text
+Same failure elsewhere
+↓
+AP03 definitely healthy
+```
+
+---
+
+# 28. What I want you to do with the uploaded package
+
+First inspect the existing package.
+
+Identify:
+
+* orchestrator
+* investigation workflow
+* correlation logic
+* authentication/association playbooks
+* roaming logic
+* AP health logic
+* PCAP handling
+* evidence/confidence logic
+* controlled intervention logic
+* README/version metadata
+
+Then determine what is **already implemented**.
+
+Do NOT duplicate existing functionality.
+
+Do NOT rewrite working modules.
+
+Make targeted improvements only where necessary.
+
+The goal is to evolve the current package into a reliable:
+
+> **Cross-Symptom, Evidence-Driven Juniper Mist Wireless Troubleshooting Engine**
+
+where:
+
+```text
+User gives symptom/client
+        ↓
+Orchestrator determines investigation plan
+        ↓
+Broad-first evidence collection
+        ↓
+Timeline construction
+        ↓
+Event attribution validation
+        ↓
+Symptom-specific deep investigation
+        ↓
+Peer/client differential analysis
+        ↓
+Controlled intervention correlation
+        ↓
+Automatic PCAP retrieval
+        ↓
+PCAP parsing/correlation when available
+        ↓
+Contradiction testing
+        ↓
+Evidence-weighted confidence
+        ↓
+RCA / hypothesis / unknown
+        ↓
+Next discriminating test
+```
+
+### Critical requirement
+
+The user should **not need to know the magic investigative prompt** that we previously had to give Claude.
+
+The orchestrator itself must discover the evidence.
+
+If the command is simply:
+
+```text
+troubleshoot client 38:18:68:b3:81:4d
+```
+
+the engine should independently perform the necessary investigation and arrive at essentially the same depth of analysis that previously required multiple manual prompts.
+
+But it must also be willing to reach:
+
+```text
+Root Cause Not Confirmed
+```
+
+when the evidence does not support a definitive RCA.
+
+That is preferable to an impressive-sounding but unsupported answer.
+
+---
+
+## One final instruction to Claude
+
+Before modifying anything, provide a concise assessment of:
+
+1. **What the current package already does**
+2. **What is missing**
+3. **Which files need modification**
+4. **Why each file needs modification**
+5. **Which existing modules will remain untouched**
+
+Then implement only the required changes.
+
+Increment the version appropriately and update the README/change metadata.
+
+Do not change unrelated working functionality.
